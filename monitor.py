@@ -13,6 +13,7 @@ Usage:
     python watcher_multi.py --wallets 0xABC...,0xDEF...
     python watcher_multi.py --interval 15
 """
+
 from __future__ import annotations
 
 import argparse
@@ -21,7 +22,6 @@ import json
 import sys
 import time
 from datetime import datetime, timezone
-from typing import Any
 
 import requests
 
@@ -62,8 +62,8 @@ def fetch_positions(wallet: str) -> list[dict]:
                 "sortBy": "CURRENT",
                 "sortDirection": "DESC",
                 "sizeThreshold": "0.1",
-                "limit": 100,
-                "offset": offset,
+                "limit": "100",
+                "offset": str(offset),
             },
             headers=HEADERS,
             timeout=30,
@@ -124,7 +124,11 @@ def resolve_token_ids(positions: list[dict]) -> dict[str, dict]:
             continue
 
         raw_outcomes = mkt.get("outcomes", "[]")
-        outcomes = json.loads(raw_outcomes) if isinstance(raw_outcomes, str) else (raw_outcomes or [])
+        outcomes = (
+            json.loads(raw_outcomes)
+            if isinstance(raw_outcomes, str)
+            else (raw_outcomes or [])
+        )
         raw_ids = mkt.get("clobTokenIds", "")
         clob_ids = raw_ids.split(",") if isinstance(raw_ids, str) else (raw_ids or [])
         clob_ids = [x.strip() for x in clob_ids if x.strip()]
@@ -232,8 +236,8 @@ def diff_positions(
 # ── WebSocket price stream (shared across all wallets) ────────────────────────
 async def ws_price_loop(
     token_ids: list[str],
-    token_map: dict[str, dict],       # token_id -> position dict (any wallet)
-    token_wallet: dict[str, str],     # token_id -> wallet address
+    token_map: dict[str, dict],  # token_id -> position dict (any wallet)
+    token_wallet: dict[str, str],  # token_id -> wallet address
     last_prices: dict[str, float],
 ) -> None:
     """
@@ -251,12 +255,16 @@ async def ws_price_loop(
                 ping_interval=None,
                 close_timeout=5,
             ) as ws:
-                sub = json.dumps({
-                    "assets_ids": token_ids,
-                    "type": "market",
-                })
+                sub = json.dumps(
+                    {
+                        "assets_ids": token_ids,
+                        "type": "market",
+                    }
+                )
                 await ws.send(sub)
-                _safe(f"[{_ts()}] [WS] subscribed to {len(token_ids)} token(s) across all wallets")
+                _safe(
+                    f"[{_ts()}] [WS] subscribed to {len(token_ids)} token(s) across all wallets"
+                )
 
                 # Keepalive — CLOB expects PING every 10s
                 async def keepalive():
@@ -295,9 +303,7 @@ async def ws_price_loop(
                                     pos = token_map.get(aid, {})
                                     wallet = token_wallet.get(aid, "?")
                                     title = (
-                                        pos.get("title")
-                                        or pos.get("slug")
-                                        or aid[:16]
+                                        pos.get("title") or pos.get("slug") or aid[:16]
                                     )
                                     outcome = pos.get("outcome", "?")
                                     _safe(
@@ -349,8 +355,8 @@ async def main(wallets: list[str], interval: int) -> int:
     _safe(f"{'=' * 60}")
 
     # ── wallet stats + initial snapshot per wallet ──
-    all_positions: dict[str, list[dict]] = {}   # wallet -> positions
-    combined_token_map: dict[str, dict] = {}    # token_id -> position
+    all_positions: dict[str, list[dict]] = {}  # wallet -> positions
+    combined_token_map: dict[str, dict] = {}  # token_id -> position
     combined_token_wallet: dict[str, str] = {}  # token_id -> wallet
 
     for i, wallet in enumerate(wallets):
@@ -364,7 +370,9 @@ async def main(wallets: list[str], interval: int) -> int:
             trades = stats.get("trades", "?")
             joined = stats.get("joinDate", "?")
             biggest = stats.get("largestWin", "?")
-            _safe(f"\n  {tag} stats: {trades} trades | joined {joined} | largest win ${biggest}")
+            _safe(
+                f"\n  {tag} stats: {trades} trades | joined {joined} | largest win ${biggest}"
+            )
 
         _safe(f"\n[{_ts()}] {tag} Fetching open positions...")
         positions = fetch_positions(wallet)
@@ -380,7 +388,9 @@ async def main(wallets: list[str], interval: int) -> int:
 
     # ── build combined token list for single shared WebSocket ──
     token_ids = list(combined_token_map.keys())
-    _safe(f"\n[{_ts()}] [WS] Resolved {len(token_ids)} unique token(s) across {len(wallets)} wallet(s)")
+    _safe(
+        f"\n[{_ts()}] [WS] Resolved {len(token_ids)} unique token(s) across {len(wallets)} wallet(s)"
+    )
 
     # Seed prices from snapshots
     last_prices: dict[str, float] = {}
@@ -395,7 +405,9 @@ async def main(wallets: list[str], interval: int) -> int:
     )
 
     # ── poll loop: check all wallets round-robin ──
-    _safe(f"\n[{_ts()}] Watching {len(wallets)} wallet(s) for new trades (Ctrl+C to stop)...\n")
+    _safe(
+        f"\n[{_ts()}] Watching {len(wallets)} wallet(s) for new trades (Ctrl+C to stop)...\n"
+    )
 
     try:
         while True:
@@ -434,7 +446,9 @@ async def main(wallets: list[str], interval: int) -> int:
                                 combined_token_wallet[tid] = wallet
                             new_ids = list(new_tmap.keys())
                             token_ids.extend(new_ids)
-                            _safe(f"[{_ts()}] [WS] adding {len(new_ids)} new token(s) from {tag}")
+                            _safe(
+                                f"[{_ts()}] [WS] adding {len(new_ids)} new token(s) from {tag}"
+                            )
                             ws_needs_restart = True
 
                     if closed:
@@ -444,7 +458,9 @@ async def main(wallets: list[str], interval: int) -> int:
                             outcome = p.get("outcome", "?")
                             pnl = float(p.get("cashPnl", 0) or 0)
                             sign = "+" if pnl >= 0 else ""
-                            _safe(f"  - {tag} {title}  [{outcome}]  PnL={sign}${pnl:.2f}")
+                            _safe(
+                                f"  - {tag} {title}  [{outcome}]  PnL={sign}${pnl:.2f}"
+                            )
 
                     if changed:
                         _safe(f"\n[{_ts()}] {tag} >>> POSITION SIZE CHANGED <<<")
@@ -475,7 +491,12 @@ async def main(wallets: list[str], interval: int) -> int:
                 except asyncio.CancelledError:
                     pass
                 ws_task = asyncio.create_task(
-                    ws_price_loop(token_ids, combined_token_map, combined_token_wallet, last_prices)
+                    ws_price_loop(
+                        token_ids,
+                        combined_token_map,
+                        combined_token_wallet,
+                        last_prices,
+                    )
                 )
 
     except KeyboardInterrupt:
