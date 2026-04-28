@@ -1,0 +1,29 @@
+# Secrets — aldrig i git
+.env
+.env.*
+!.env.example
+
+# Claude memory (ECC bug #8)
+.claude/memory.md
+.claude/sessions/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+htmlcov/
+.coverage
+
+# Alembic
+alembic/versions/__pycache__/
+
+# OS
+.DS_Store
+Thumbs.db
