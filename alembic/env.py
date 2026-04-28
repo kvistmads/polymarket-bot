@@ -1,4 +1,5 @@
 """Alembic environment — bruger psycopg2 (sync) til migrations."""
+
 from __future__ import annotations
 
 import os

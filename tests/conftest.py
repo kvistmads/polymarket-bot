@@ -4,6 +4,7 @@ tests/conftest.py — pytest fixtures til Polymarket bot.
 Tilpasset ECC eval-harness pattern til Python/pytest (ECC bug #6 fix).
 Alle DB-tests kører i en transaction der rulles tilbage — ingen persistent state.
 """
+
 from __future__ import annotations
 
 import os

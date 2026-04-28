@@ -4,6 +4,7 @@ db.py — Delt asyncpg connection pool.
 Bruges af: monitor.py, executor.py, filter.py
 Import:    from db import get_pool, acquire, close_pool
 """
+
 from __future__ import annotations
 
 import logging
