@@ -18,34 +18,24 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-import logging
-import os
 import sys
 import time
 from datetime import datetime, timezone
 from typing import Any
 
 import requests
-from dotenv import load_dotenv
 
 try:
     import websockets
 except ImportError:
     sys.exit("Missing dependency: pip install websockets")
 
-load_dotenv()
-
-# ── konfiguration via env vars ────────────────────────────────────────────────
-DEFAULT_WALLETS: list[str] = [
-    w.strip()
-    for w in os.getenv(
-        "FOLLOWED_WALLETS", "0x0b7a6030507efe5db145fbb57a25ba0c5f9d86cf"
-    ).split(",")
-    if w.strip()
+# ── defaults ──────────────────────────────────────────────────────────────────
+DEFAULT_WALLETS = [
+    "0x0b7a6030507efe5db145fbb57a25ba0c5f9d86cf",
+    # Add more wallets here or pass via --wallets
 ]
-POLL_INTERVAL: int = int(os.getenv("POLL_INTERVAL", "30"))
-LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
-DB_URL: str = os.getenv("DB_URL", "")
+POLL_INTERVAL = 30  # seconds
 
 # ── endpoints ─────────────────────────────────────────────────────────────────
 DATA_API = "https://data-api.polymarket.com"
