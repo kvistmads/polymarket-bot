@@ -177,7 +177,7 @@ Opdater denne sektion når faser gennemføres:
 
 - [x] **Fase 1:** Database-fundament (Alembic + db.py)
 - [x] **Fase 2:** Monitor udvidelse (DB-writes + fixes)
-- [ ] **Fase 3:** Trade Executor (gates + sizing + Telegram)
+- [x] **Fase 3:** Trade Executor (gates + sizing + Telegram)
 - [ ] **Fase 4:** Filter Scanner CLI
 - [ ] **Fase 5:** Docker + Hetzner deployment
 
