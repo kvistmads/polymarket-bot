@@ -19,8 +19,7 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    op.execute(
-        """
+    op.execute("""
         CREATE TABLE wallet_scores (
             wallet_id          BIGINT PRIMARY KEY REFERENCES wallets(id),
             trades_total       INTEGER NOT NULL DEFAULT 0,
@@ -36,8 +35,7 @@ def upgrade() -> None:
             annual_return_pct  NUMERIC(8,4),
             last_scored_at     TIMESTAMPTZ
         )
-        """
-    )
+        """)
 
 
 def downgrade() -> None:

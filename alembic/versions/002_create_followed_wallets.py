@@ -19,8 +19,7 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    op.execute(
-        """
+    op.execute("""
         CREATE TABLE followed_wallets (
             id                BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
             wallet_id         BIGINT NOT NULL REFERENCES wallets(id),
@@ -29,14 +28,11 @@ def upgrade() -> None:
             unfollowed_at     TIMESTAMPTZ,
             reason            TEXT
         )
-        """
-    )
-    op.execute(
-        """
+        """)
+    op.execute("""
         CREATE INDEX idx_followed_wallets_active
             ON followed_wallets (wallet_id, unfollowed_at)
-        """
-    )
+        """)
 
 
 def downgrade() -> None:

@@ -19,8 +19,7 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    op.execute(
-        """
+    op.execute("""
         CREATE TABLE daily_stats (
             date               DATE PRIMARY KEY DEFAULT CURRENT_DATE,
             total_spent        NUMERIC(18,4) NOT NULL DEFAULT 0,
@@ -32,8 +31,7 @@ def upgrade() -> None:
             paper_orders_count INTEGER NOT NULL DEFAULT 0,
             last_updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
         )
-        """
-    )
+        """)
 
 
 def downgrade() -> None:

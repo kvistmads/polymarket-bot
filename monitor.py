@@ -19,11 +19,23 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
+import os
 import sys
 import time
 from datetime import datetime, timezone
 
+import asyncpg
 import requests
+from aiohttp import web
+from dotenv import load_dotenv
+
+from db import acquire
+
+load_dotenv()
+
+DB_URL: str | None = os.getenv("DB_URL")
+LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
 
 try:
     import websockets
@@ -37,6 +49,14 @@ DEFAULT_WALLETS = [
 ]
 POLL_INTERVAL = 30  # seconds
 
+# ── logging setup ─────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s %(levelname)-8s %(name)s — %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("monitor")
+
 # ── endpoints ─────────────────────────────────────────────────────────────────
 DATA_API = "https://data-api.polymarket.com"
 GAMMA_API = "https://gamma-api.polymarket.com"
@@ -47,6 +67,106 @@ HEADERS = {
     "Origin": "https://polymarket.com",
     "Referer": "https://polymarket.com/",
 }
+
+
+# ── database helpers ──────────────────────────────────────────────────────────
+def _decimal(value: object) -> float | None:
+    """Konvertér API-streng til float — returnér None ved None/tom streng."""
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+
+
+async def _get_or_create_wallet_id(conn: asyncpg.Connection, address: str) -> int:
+    """Returnér wallet.id — indsæt wallets-rækken hvis den ikke findes."""
+    row = await conn.fetchrow("SELECT id FROM wallets WHERE address = $1", address)
+    if row:
+        return int(row["id"])
+    new_id = await conn.fetchval(
+        "INSERT INTO wallets (address) VALUES ($1) RETURNING id", address
+    )
+    log.info("Inserted new wallet: %s → id=%s", address[:10], new_id)
+    return int(new_id)
+
+
+async def _db_upsert_position(
+    conn: asyncpg.Connection, wallet_id: int, pos: dict
+) -> None:
+    """Upsert én position fra Polymarket API-response til positions-tabellen."""
+    await conn.execute(
+        """
+        INSERT INTO positions (
+            wallet_id, condition_id, outcome, size, avg_price, cur_price,
+            current_value, cash_pnl, percent_pnl, token_id, title,
+            first_seen_at, last_updated_at, status
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,now(),now(),'open')
+        ON CONFLICT (wallet_id, condition_id, outcome)
+        DO UPDATE SET
+            size            = EXCLUDED.size,
+            avg_price       = EXCLUDED.avg_price,
+            cur_price       = EXCLUDED.cur_price,
+            current_value   = EXCLUDED.current_value,
+            cash_pnl        = EXCLUDED.cash_pnl,
+            percent_pnl     = EXCLUDED.percent_pnl,
+            last_updated_at = now()
+        """,
+        wallet_id,
+        pos.get("conditionId", ""),
+        pos.get("outcome", ""),
+        _decimal(pos.get("size")),
+        _decimal(pos.get("avgPrice") or pos.get("buyAvg")),
+        _decimal(pos.get("curPrice")),
+        _decimal(pos.get("currentValue")),
+        _decimal(pos.get("cashPnl")),
+        _decimal(pos.get("percentPnl")),
+        pos.get("asset", ""),
+        pos.get("title") or pos.get("slug", ""),
+    )
+
+
+async def _db_mark_closed(conn: asyncpg.Connection, wallet_id: int, pos: dict) -> None:
+    """Marker en position som closed i databasen."""
+    await conn.execute(
+        """
+        UPDATE positions SET status = 'closed', last_updated_at = now()
+        WHERE wallet_id = $1
+          AND condition_id = $2
+          AND outcome = $3
+          AND status = 'open'
+        """,
+        wallet_id,
+        pos.get("conditionId", ""),
+        pos.get("outcome", ""),
+    )
+
+
+async def _db_insert_trade_event(
+    conn: asyncpg.Connection,
+    wallet_id: int,
+    event_type: str,
+    new_pos: dict,
+    old_pos: dict | None = None,
+) -> None:
+    """Indsæt én immutable trade_event-række."""
+    await conn.execute(
+        """
+        INSERT INTO trade_events (
+            wallet_id, condition_id, outcome, event_type,
+            old_size, new_size, price_at_event, pnl_at_close
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+        """,
+        wallet_id,
+        new_pos.get("conditionId", ""),
+        new_pos.get("outcome", ""),
+        event_type,
+        _decimal(old_pos.get("size")) if old_pos else None,
+        _decimal(new_pos.get("size")),
+        _decimal(new_pos.get("curPrice")),
+        _decimal(new_pos.get("cashPnl")) if event_type == "closed" else None,
+    )
 
 
 # ── REST helpers ──────────────────────────────────────────────────────────────
@@ -158,27 +278,69 @@ def fetch_user_stats(wallet: str) -> dict | None:
     return None
 
 
+# ── async wrappers (fix #11, #12) ─────────────────────────────────────────────
+async def fetch_positions_with_retry(
+    wallet: str,
+    max_attempts: int = 3,
+) -> list[dict]:
+    """Hent positioner med eksponentiel backoff ved 429/5xx.
+
+    Returnerer tom liste efter max_attempts mislykkede forsøg.
+    Kører den synkrone HTTP-call i executor pool så event-loopet ikke blokeres.
+    """
+    loop = asyncio.get_event_loop()
+    for attempt in range(max_attempts):
+        try:
+            return await loop.run_in_executor(None, fetch_positions, wallet)
+        except requests.HTTPError as exc:
+            status = exc.response.status_code if exc.response is not None else 0
+            if status == 429 or status >= 500:
+                wait = 2**attempt  # 1s, 2s, 4s
+                log.warning(
+                    "%s HTTP %s — retry %d/%d in %ds",
+                    _w(wallet),
+                    status,
+                    attempt + 1,
+                    max_attempts,
+                    wait,
+                )
+                await asyncio.sleep(wait)
+            else:
+                log.error("%s HTTP error %s — giving up", _w(wallet), status)
+                return []
+        except requests.RequestException as exc:
+            log.warning("%s request error attempt %d: %s", _w(wallet), attempt + 1, exc)
+            if attempt < max_attempts - 1:
+                await asyncio.sleep(2**attempt)
+    log.warning(
+        "%s all %d attempts failed — skipping this poll",
+        _w(wallet),
+        max_attempts,
+    )
+    return []
+
+
+async def fetch_user_stats_async(wallet: str) -> dict | None:
+    """Async wrapper for fetch_user_stats — kører i executor pool."""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, fetch_user_stats, wallet)
+
+
 # ── display helpers ───────────────────────────────────────────────────────────
-def _ts() -> str:
-    return datetime.now(timezone.utc).strftime("%H:%M:%S")
+def _w(wallet: str, label: str = "") -> str:
+    """Kort wallet-tag til loglinjer.
 
-
-def _safe(s: str) -> None:
-    try:
-        print(s, flush=True)
-    except UnicodeEncodeError:
-        print(s.encode("ascii", "replace").decode(), flush=True)
-
-
-def _w(wallet: str) -> str:
-    """Short wallet tag for log lines, e.g. [0x0b7a…86cf]"""
+    Foretrækker brugbart label hvis tilgængeligt, ellers kort wallet-prefix.
+    """
+    if label:
+        return f"[{label}]"
     return f"[{wallet[:6]}…{wallet[-4:]}]"
 
 
-def display_positions(positions: list[dict], wallet: str) -> None:
-    tag = _w(wallet)
+def display_positions(positions: list[dict], wallet: str, label: str = "") -> None:
+    tag = _w(wallet, label)
     if not positions:
-        _safe(f"  {tag} (no open positions)")
+        log.info("%s (no open positions)", tag)
         return
 
     total_val = 0.0
@@ -198,15 +360,22 @@ def display_positions(positions: list[dict], wallet: str) -> None:
         total_pnl += pnl
 
         sign = "+" if pnl >= 0 else ""
-        _safe(f"  {tag} {title}")
-        _safe(
-            f"    {outcome}  |  size={size:.1f}  avg=${avg:.3f}  now=${cur_price:.2f}"
-            f"  val=${cur_val:.2f}  PnL={sign}${pnl:.2f} ({sign}{pnl_pct:.1f}%)"
+        log.info("%s %s", tag, title)
+        log.info(
+            "    %s  |  size=%.1f  avg=$%.3f  now=$%.2f  val=$%.2f  PnL=%s$%.2f (%s%.1f%%)",
+            outcome,
+            size,
+            avg,
+            cur_price,
+            cur_val,
+            sign,
+            pnl,
+            sign,
+            pnl_pct,
         )
 
-    _safe(f"  {tag} {'─' * 50}")
     sign = "+" if total_pnl >= 0 else ""
-    _safe(f"  {tag} TOTAL  val=${total_val:.2f}  PnL={sign}${total_pnl:.2f}")
+    log.info("%s TOTAL  val=$%.2f  PnL=%s$%.2f", tag, total_val, sign, total_pnl)
 
 
 # ── diff engine ───────────────────────────────────────────────────────────────
@@ -239,13 +408,16 @@ async def ws_price_loop(
     token_map: dict[str, dict],  # token_id -> position dict (any wallet)
     token_wallet: dict[str, str],  # token_id -> wallet address
     last_prices: dict[str, float],
+    new_tokens_queue: asyncio.Queue[list[str]],
 ) -> None:
     """
     Connect to the CLOB market WebSocket and stream live price updates
     for ALL tokens across ALL watched wallets — one shared connection.
+
+    Nye tokens tilføjes dynamisk via ``new_tokens_queue`` — ingen fuld reconnect.
     """
     if not token_ids:
-        _safe(f"[{_ts()}] [WS] no tokens to subscribe — skipping WebSocket")
+        log.info("[WS] no tokens to subscribe — skipping WebSocket")
         return
 
     while True:
@@ -262,12 +434,13 @@ async def ws_price_loop(
                     }
                 )
                 await ws.send(sub)
-                _safe(
-                    f"[{_ts()}] [WS] subscribed to {len(token_ids)} token(s) across all wallets"
+                log.info(
+                    "[WS] subscribed to %d token(s) across all wallets",
+                    len(token_ids),
                 )
 
                 # Keepalive — CLOB expects PING every 10s
-                async def keepalive():
+                async def keepalive() -> None:
                     while True:
                         await asyncio.sleep(10)
                         try:
@@ -275,7 +448,25 @@ async def ws_price_loop(
                         except Exception:
                             break
 
+                async def drain_new_tokens() -> None:
+                    """Lyt på køen og send ny SUBSCRIBE-besked — ingen reconnect."""
+                    while True:
+                        new_ids = await new_tokens_queue.get()
+                        try:
+                            await ws.send(
+                                json.dumps({"assets_ids": new_ids, "type": "market"})
+                            )
+                            log.info(
+                                "[WS] dynamically subscribed to %d new token(s)",
+                                len(new_ids),
+                            )
+                        except Exception as exc:
+                            log.warning(
+                                "[WS] failed to send dynamic subscribe: %s", exc
+                            )
+
                 ka = asyncio.create_task(keepalive())
+                dt = asyncio.create_task(drain_new_tokens())
 
                 try:
                     async for raw in ws:
@@ -306,9 +497,13 @@ async def ws_price_loop(
                                         pos.get("title") or pos.get("slug") or aid[:16]
                                     )
                                     outcome = pos.get("outcome", "?")
-                                    _safe(
-                                        f"[{_ts()}] [TRADE] {_w(wallet)} {title} ({outcome})"
-                                        f"  ${prev:.3f} -> ${price:.3f}"
+                                    log.info(
+                                        "[TRADE] %s %s (%s)  $%.3f -> $%.3f",
+                                        _w(wallet),
+                                        title,
+                                        outcome,
+                                        prev,
+                                        price,
                                     )
                                 last_prices[aid] = price
 
@@ -328,14 +523,43 @@ async def ws_price_loop(
                                         last_prices[aid] = (best_bid + best_ask) / 2
 
                 except websockets.ConnectionClosed:
-                    _safe(f"[{_ts()}] [WS] connection closed, reconnecting...")
+                    log.warning("[WS] connection closed, reconnecting...")
                 finally:
                     ka.cancel()
+                    dt.cancel()
 
-        except Exception as e:
-            _safe(f"[{_ts()}] [WS] error: {e}")
+        except Exception as exc:
+            log.error("[WS] error: %s", exc)
 
         await asyncio.sleep(5)
+
+
+# ── health server (fix #14) ───────────────────────────────────────────────────
+_last_successful_poll: float = 0.0
+
+
+async def _start_health_server(poll_interval: int) -> web.AppRunner:
+    """Start /health endpoint på port 8080.
+
+    Returnerer 503 hvis seneste vellykkede poll er > 3x poll_interval gammel.
+    """
+
+    async def health_handler(request: web.Request) -> web.Response:
+        if _last_successful_poll == 0.0:
+            return web.Response(status=503, text="not_started")
+        age = time.time() - _last_successful_poll
+        if age > poll_interval * 3:
+            return web.Response(status=503, text=f"stale:{age:.0f}s")
+        return web.Response(text="ok")
+
+    app = web.Application()
+    app.router.add_get("/health", health_handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", 8080)
+    await site.start()
+    log.info("Health endpoint started on :8080/health")
+    return runner
 
 
 # ── main loop ─────────────────────────────────────────────────────────────────
@@ -346,13 +570,19 @@ async def main(wallets: list[str], interval: int) -> int:
         except Exception:
             pass
 
-    _safe(f"\n{'=' * 60}")
-    _safe(f"  POLYMARKET WALLET WATCHER — {len(wallets)} wallet(s)")
+    log.info("=" * 60)
+    log.info("POLYMARKET WALLET WATCHER — %d wallet(s)", len(wallets))
     for w in wallets:
-        _safe(f"  Wallet:   {w}")
-    _safe(f"  Polling:  every {interval}s")
-    _safe(f"  Started:  {datetime.now(timezone.utc).isoformat(timespec='seconds')}Z")
-    _safe(f"{'=' * 60}")
+        log.info("Wallet:   %s", w)
+    log.info("Polling:  every %ds", interval)
+    log.info(
+        "Started:  %s",
+        datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    )
+    log.info("=" * 60)
+
+    # ── start health server ──
+    health_runner = await _start_health_server(interval)
 
     # ── wallet stats + initial snapshot per wallet ──
     all_positions: dict[str, list[dict]] = {}  # wallet -> positions
@@ -365,18 +595,22 @@ async def main(wallets: list[str], interval: int) -> int:
 
         tag = _w(wallet)
 
-        stats = fetch_user_stats(wallet)
+        stats = await fetch_user_stats_async(wallet)
         if stats:
             trades = stats.get("trades", "?")
             joined = stats.get("joinDate", "?")
             biggest = stats.get("largestWin", "?")
-            _safe(
-                f"\n  {tag} stats: {trades} trades | joined {joined} | largest win ${biggest}"
+            log.info(
+                "%s stats: %s trades | joined %s | largest win $%s",
+                tag,
+                trades,
+                joined,
+                biggest,
             )
 
-        _safe(f"\n[{_ts()}] {tag} Fetching open positions...")
-        positions = fetch_positions(wallet)
-        _safe(f"[{_ts()}] {tag} Found {len(positions)} open position(s)")
+        log.info("%s Fetching open positions...", tag)
+        positions = await fetch_positions_with_retry(wallet)
+        log.info("%s Found %d open position(s)", tag, len(positions))
         display_positions(positions, wallet)
         all_positions[wallet] = positions
 
@@ -388,8 +622,10 @@ async def main(wallets: list[str], interval: int) -> int:
 
     # ── build combined token list for single shared WebSocket ──
     token_ids = list(combined_token_map.keys())
-    _safe(
-        f"\n[{_ts()}] [WS] Resolved {len(token_ids)} unique token(s) across {len(wallets)} wallet(s)"
+    log.info(
+        "[WS] Resolved %d unique token(s) across %d wallet(s)",
+        len(token_ids),
+        len(wallets),
     )
 
     # Seed prices from snapshots
@@ -400,20 +636,28 @@ async def main(wallets: list[str], interval: int) -> int:
             last_prices[tid] = cp
 
     # ── start ONE shared WebSocket in background ──
+    new_tokens_queue: asyncio.Queue[list[str]] = asyncio.Queue()
     ws_task = asyncio.create_task(
-        ws_price_loop(token_ids, combined_token_map, combined_token_wallet, last_prices)
+        ws_price_loop(
+            token_ids,
+            combined_token_map,
+            combined_token_wallet,
+            last_prices,
+            new_tokens_queue,
+        )
     )
 
     # ── poll loop: check all wallets round-robin ──
-    _safe(
-        f"\n[{_ts()}] Watching {len(wallets)} wallet(s) for new trades (Ctrl+C to stop)...\n"
+    log.info(
+        "Watching %d wallet(s) for new trades (Ctrl+C to stop)...",
+        len(wallets),
     )
+
+    global _last_successful_poll
 
     try:
         while True:
             await asyncio.sleep(interval)
-
-            ws_needs_restart = False
 
             for i, wallet in enumerate(wallets):
                 if i > 0:
@@ -421,24 +665,63 @@ async def main(wallets: list[str], interval: int) -> int:
 
                 tag = _w(wallet)
                 try:
-                    current = fetch_positions(wallet)
+                    current = await fetch_positions_with_retry(wallet)
                     prev = all_positions[wallet]
                     opened, closed, changed = diff_positions(prev, current)
 
+                    if opened or closed or changed:
+                        if DB_URL:
+                            try:
+                                async with acquire() as conn:
+                                    wallet_id = await _get_or_create_wallet_id(
+                                        conn, wallet
+                                    )
+                                    for p in opened:
+                                        await _db_insert_trade_event(
+                                            conn, wallet_id, "opened", p
+                                        )
+                                        await _db_upsert_position(conn, wallet_id, p)
+                                    for p in closed:
+                                        await _db_insert_trade_event(
+                                            conn, wallet_id, "closed", p
+                                        )
+                                        await _db_mark_closed(conn, wallet_id, p)
+                                    for old_p, new_p in changed:
+                                        await _db_insert_trade_event(
+                                            conn,
+                                            wallet_id,
+                                            "resized",
+                                            new_p,
+                                            old_p,
+                                        )
+                                        await _db_upsert_position(
+                                            conn, wallet_id, new_p
+                                        )
+                            except Exception:
+                                log.exception(
+                                    "%s DB write failed — continuing without persistence",
+                                    tag,
+                                )
+
                     if opened:
-                        _safe(f"\n[{_ts()}] {tag} >>> NEW POSITION(S) <<<")
+                        log.info("%s >>> NEW POSITION(S) <<<", tag)
                         for p in opened:
                             title = p.get("title") or p.get("slug") or "?"
                             outcome = p.get("outcome", "?")
                             size = float(p.get("size", 0) or 0)
                             avg = float(p.get("avgPrice", 0) or p.get("buyAvg", 0) or 0)
                             cur_val = float(p.get("currentValue", 0) or 0)
-                            _safe(
-                                f"  + {tag} {title}  [{outcome}]"
-                                f"  size={size:.1f}  avg=${avg:.3f}  val=${cur_val:.2f}"
+                            log.info(
+                                "  + %s %s  [%s]  size=%.1f  avg=$%.3f  val=$%.2f",
+                                tag,
+                                title,
+                                outcome,
+                                size,
+                                avg,
+                                cur_val,
                             )
 
-                        # Add new tokens to shared maps
+                        # Add new tokens to shared maps + dynamic resubscribe
                         new_tmap = resolve_token_ids(opened)
                         if new_tmap:
                             combined_token_map.update(new_tmap)
@@ -446,24 +729,31 @@ async def main(wallets: list[str], interval: int) -> int:
                                 combined_token_wallet[tid] = wallet
                             new_ids = list(new_tmap.keys())
                             token_ids.extend(new_ids)
-                            _safe(
-                                f"[{_ts()}] [WS] adding {len(new_ids)} new token(s) from {tag}"
+                            await new_tokens_queue.put(new_ids)
+                            log.info(
+                                "[WS] queued %d new token(s) from %s",
+                                len(new_ids),
+                                tag,
                             )
-                            ws_needs_restart = True
 
                     if closed:
-                        _safe(f"\n[{_ts()}] {tag} >>> POSITION(S) CLOSED <<<")
+                        log.info("%s >>> POSITION(S) CLOSED <<<", tag)
                         for p in closed:
                             title = p.get("title") or p.get("slug") or "?"
                             outcome = p.get("outcome", "?")
                             pnl = float(p.get("cashPnl", 0) or 0)
                             sign = "+" if pnl >= 0 else ""
-                            _safe(
-                                f"  - {tag} {title}  [{outcome}]  PnL={sign}${pnl:.2f}"
+                            log.info(
+                                "  - %s %s  [%s]  PnL=%s$%.2f",
+                                tag,
+                                title,
+                                outcome,
+                                sign,
+                                pnl,
                             )
 
                     if changed:
-                        _safe(f"\n[{_ts()}] {tag} >>> POSITION SIZE CHANGED <<<")
+                        log.info("%s >>> POSITION SIZE CHANGED <<<", tag)
                         for old_p, new_p in changed:
                             title = new_p.get("title") or new_p.get("slug") or "?"
                             outcome = new_p.get("outcome", "?")
@@ -471,42 +761,34 @@ async def main(wallets: list[str], interval: int) -> int:
                             new_sz = float(new_p.get("size", 0) or 0)
                             delta = new_sz - old_sz
                             sign = "+" if delta > 0 else ""
-                            _safe(
-                                f"  ~ {tag} {title}  [{outcome}]"
-                                f"  {old_sz:.1f} -> {new_sz:.1f} ({sign}{delta:.1f})"
+                            log.info(
+                                "  ~ %s %s  [%s]  %.1f -> %.1f (%s%.1f)",
+                                tag,
+                                title,
+                                outcome,
+                                old_sz,
+                                new_sz,
+                                sign,
+                                delta,
                             )
 
                     all_positions[wallet] = current
+                    _last_successful_poll = time.time()
 
-                except requests.RequestException as e:
-                    _safe(f"[{_ts()}] {tag} [POLL] Request error: {e}")
-                except Exception as e:
-                    _safe(f"[{_ts()}] {tag} [POLL] Error: {e}")
-
-            # Restart shared WS once after all wallets polled if new tokens appeared
-            if ws_needs_restart:
-                ws_task.cancel()
-                try:
-                    await ws_task
-                except asyncio.CancelledError:
-                    pass
-                ws_task = asyncio.create_task(
-                    ws_price_loop(
-                        token_ids,
-                        combined_token_map,
-                        combined_token_wallet,
-                        last_prices,
-                    )
-                )
+                except requests.RequestException as exc:
+                    log.warning("%s poll error: %s", tag, exc)
+                except Exception:
+                    log.exception("%s unexpected error", tag)
 
     except KeyboardInterrupt:
-        _safe(f"\n[{_ts()}] Shutting down...")
+        log.info("Shutting down...")
     finally:
         ws_task.cancel()
         try:
             await ws_task
         except asyncio.CancelledError:
             pass
+        await health_runner.cleanup()
 
     return 0
 

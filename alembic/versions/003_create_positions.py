@@ -19,8 +19,7 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    op.execute(
-        """
+    op.execute("""
         CREATE TABLE positions (
             id              BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
             wallet_id       BIGINT NOT NULL REFERENCES wallets(id),
@@ -42,14 +41,11 @@ def upgrade() -> None:
             CONSTRAINT positions_unique
                 UNIQUE (wallet_id, condition_id, outcome)
         )
-        """
-    )
-    op.execute(
-        """
+        """)
+    op.execute("""
         CREATE INDEX idx_positions_wallet_status
             ON positions (wallet_id, status)
-        """
-    )
+        """)
 
 
 def downgrade() -> None:

@@ -19,8 +19,7 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    op.execute(
-        """
+    op.execute("""
         CREATE TABLE wallet_score_snapshots (
             id                BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
             wallet_id         BIGINT NOT NULL REFERENCES wallets(id),
@@ -36,14 +35,11 @@ def upgrade() -> None:
             sizing_entropy    NUMERIC(8,4),
             annual_return_pct NUMERIC(8,4)
         )
-        """
-    )
-    op.execute(
-        """
+        """)
+    op.execute("""
         CREATE INDEX idx_wallet_score_snapshots_wallet_ts
             ON wallet_score_snapshots (wallet_id, snapshot_at)
-        """
-    )
+        """)
 
 
 def downgrade() -> None:

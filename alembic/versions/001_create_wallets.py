@@ -19,8 +19,7 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    op.execute(
-        """
+    op.execute("""
         CREATE TABLE wallets (
             id       BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
             address  TEXT NOT NULL,
@@ -29,13 +28,10 @@ def upgrade() -> None:
             notes    TEXT,
             CONSTRAINT wallets_address_key UNIQUE (address)
         )
-        """
-    )
-    op.execute(
-        """
+        """)
+    op.execute("""
         CREATE INDEX idx_wallets_address ON wallets (address)
-        """
-    )
+        """)
 
 
 def downgrade() -> None:
