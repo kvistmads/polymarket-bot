@@ -2,12 +2,11 @@ asyncpg==0.29.0
 psycopg2-binary==2.9.9
 alembic==1.13.1
 python-dotenv==1.0.1
-httpx>=0.27
+httpx==0.27.0
 websockets==12.0
 requests==2.31.0
 aiohttp==3.9.5
 python-telegram-bot==21.3
-py-clob-client>=0.17
 ruff==0.4.4
 black==24.4.2
 mypy==1.10.0
