@@ -19,8 +19,7 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    op.execute(
-        """
+    op.execute("""
         CREATE OR REPLACE FUNCTION notify_new_trade_event()
         RETURNS trigger AS $$
         BEGIN
@@ -28,15 +27,12 @@ def upgrade() -> None:
             RETURN NEW;
         END;
         $$ LANGUAGE plpgsql
-        """
-    )
-    op.execute(
-        """
+        """)
+    op.execute("""
         CREATE TRIGGER trade_events_notify
             AFTER INSERT ON trade_events
             FOR EACH ROW EXECUTE FUNCTION notify_new_trade_event()
-        """
-    )
+        """)
 
 
 def downgrade() -> None:

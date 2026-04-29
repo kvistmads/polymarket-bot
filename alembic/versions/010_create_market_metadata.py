@@ -19,8 +19,7 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    op.execute(
-        """
+    op.execute("""
         CREATE TABLE market_metadata (
             condition_id   TEXT PRIMARY KEY,
             title          TEXT,
@@ -29,8 +28,7 @@ def upgrade() -> None:
             clob_token_ids JSONB,
             fetched_at     TIMESTAMPTZ NOT NULL DEFAULT now()
         )
-        """
-    )
+        """)
 
 
 def downgrade() -> None:

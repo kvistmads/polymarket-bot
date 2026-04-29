@@ -19,8 +19,7 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    op.execute(
-        """
+    op.execute("""
         CREATE OR REPLACE FUNCTION deny_trade_events_mutation()
         RETURNS trigger AS $$
         BEGIN
@@ -28,22 +27,17 @@ def upgrade() -> None:
                 'trade_events is immutable — UPDATE and DELETE are forbidden';
         END;
         $$ LANGUAGE plpgsql
-        """
-    )
-    op.execute(
-        """
+        """)
+    op.execute("""
         CREATE TRIGGER trade_events_deny_update
             BEFORE UPDATE ON trade_events
             FOR EACH ROW EXECUTE FUNCTION deny_trade_events_mutation()
-        """
-    )
-    op.execute(
-        """
+        """)
+    op.execute("""
         CREATE TRIGGER trade_events_deny_delete
             BEFORE DELETE ON trade_events
             FOR EACH ROW EXECUTE FUNCTION deny_trade_events_mutation()
-        """
-    )
+        """)
 
 
 def downgrade() -> None:

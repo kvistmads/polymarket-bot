@@ -19,8 +19,7 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    op.execute(
-        """
+    op.execute("""
         CREATE TABLE copy_orders (
             id               BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
             source_wallet_id BIGINT NOT NULL REFERENCES wallets(id),
@@ -42,20 +41,15 @@ def upgrade() -> None:
                     'failed', 'cancelled', 'paper'
                 ))
         )
-        """
-    )
-    op.execute(
-        """
+        """)
+    op.execute("""
         CREATE INDEX idx_copy_orders_wallet_ts
             ON copy_orders (source_wallet_id, timestamp)
-        """
-    )
-    op.execute(
-        """
+        """)
+    op.execute("""
         CREATE INDEX idx_copy_orders_status_ts
             ON copy_orders (status, timestamp)
-        """
-    )
+        """)
 
 
 def downgrade() -> None:

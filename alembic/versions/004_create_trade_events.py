@@ -19,8 +19,7 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    op.execute(
-        """
+    op.execute("""
         CREATE TABLE trade_events (
             id             BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
             wallet_id      BIGINT NOT NULL REFERENCES wallets(id),
@@ -35,20 +34,15 @@ def upgrade() -> None:
             CONSTRAINT trade_events_event_type_check
                 CHECK (event_type IN ('opened', 'closed', 'resized'))
         )
-        """
-    )
-    op.execute(
-        """
+        """)
+    op.execute("""
         CREATE INDEX idx_trade_events_wallet_ts
             ON trade_events (wallet_id, timestamp)
-        """
-    )
-    op.execute(
-        """
+        """)
+    op.execute("""
         CREATE INDEX idx_trade_events_condition_ts
             ON trade_events (condition_id, timestamp)
-        """
-    )
+        """)
 
 
 def downgrade() -> None:
