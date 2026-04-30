@@ -5,7 +5,7 @@ Gate 1: Wallet aktuelt fulgt (unfollowed_at IS NULL)?
 Gate 2: Kun 'opened' events?
 Gate 3: Ikke allerede eksponeret i markedet?
 Gate 4: Markedet likvidt (spread < 5%)?
-Gate 5: Mere end 2 timer til close?
+Gate 5: Mere end 30 minutter til close?
 Gate 6: Order-size inden for hard cap?
 Gate 7: Daglig loss limit ikke nået?
 
@@ -35,7 +35,7 @@ MAX_DAILY_LOSS: Decimal = Decimal(os.getenv("MAX_DAILY_LOSS", "50"))
 _SIZE_HARD_CAP_PCT = Decimal("0.20")
 _MIN_ORDER_SIZE = Decimal("1.0")
 _MAX_SPREAD = Decimal("0.05")
-_MARKET_CLOSE_BUFFER_H = 2
+_MARKET_CLOSE_BUFFER_MINUTES = 30
 
 
 async def passes_gates(conn: asyncpg.Connection, event: TradeEvent) -> tuple[bool, str]:
@@ -182,11 +182,11 @@ async def _gate5_market_close(
             return False, "endDate mangler i Gamma API svar"
 
         end_date = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
-        cutoff = datetime.now(timezone.utc) + timedelta(hours=_MARKET_CLOSE_BUFFER_H)
+        cutoff = datetime.now(timezone.utc) + timedelta(minutes=_MARKET_CLOSE_BUFFER_MINUTES)
         if end_date < cutoff:
             return (
                 False,
-                f"marked lukker om < {_MARKET_CLOSE_BUFFER_H}t ({end_date.isoformat()})",
+                f"marked lukker om < {_MARKET_CLOSE_BUFFER_MINUTES}min ({end_date.isoformat()})",
             )
         return True, ""
     except Exception:
