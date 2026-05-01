@@ -43,10 +43,12 @@ except ImportError:
     sys.exit("Missing dependency: pip install websockets")
 
 # ── defaults ──────────────────────────────────────────────────────────────────
-DEFAULT_WALLETS = [
-    "0x0b7a6030507efe5db145fbb57a25ba0c5f9d86cf",
-    # Add more wallets here or pass via --wallets
-]
+_followed_wallets_env = os.getenv("FOLLOWED_WALLETS", "")
+DEFAULT_WALLETS = (
+    [w.strip() for w in _followed_wallets_env.split(",") if w.strip()]
+    if _followed_wallets_env
+    else ["0x0b7a6030507efe5db145fbb57a25ba0c5f9d86cf"]
+)
 POLL_INTERVAL = 30  # seconds
 
 # ── logging setup ─────────────────────────────────────────────────────────────
