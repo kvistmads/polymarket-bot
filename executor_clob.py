@@ -42,9 +42,11 @@ def _get_clob_client():
     from py_clob_client.client import ClobClient  # type: ignore[import]
 
     key = os.environ["POLYMARKET_PRIVATE_KEY"]
-    _clob_client = ClobClient(host=CLOB_BASE, chain_id=_CHAIN_ID, private_key=key)
+    # py_clob_client >= 0.17 bruger 'key' i stedet for 'private_key'
+    _clob_client = ClobClient(host=CLOB_BASE, key=key, chain_id=_CHAIN_ID, signature_type=0)
     try:
-        _clob_client.set_api_creds(_clob_client.derive_api_key())
+        creds = _clob_client.create_or_derive_api_creds()
+        _clob_client.set_api_creds(creds)
         log.info("CLOB client initialiseret (key redacted)")
     except Exception:
         log.exception("Kunne ikke hente CLOB API credentials")
