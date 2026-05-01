@@ -1,13 +1,13 @@
 """
-executor_gates.py — 7-gate verifikation for trade executor.
+executor_gates.py — Gate verifikation for trade executor.
 
-Gate 1: Wallet aktuelt fulgt (unfollowed_at IS NULL)?
-Gate 2: Kun 'opened' events?
-Gate 3: Ikke allerede eksponeret i markedet?
-Gate 4: Markedet likvidt (spread < 5%)?
-Gate 5: Mere end 30 minutter til close?
-Gate 6: Order-size inden for hard cap?
-Gate 7: Daglig loss limit ikke nået?
+Gate 1: Wallet aktuelt fulgt (unfollowed_at IS NULL)?         [AKTIV]
+Gate 2: Kun 'opened' events?                                  [DEAKTIVERET — filtreres i monitor]
+Gate 3: Ikke allerede eksponeret i markedet?                  [DEAKTIVERET — tillad akkumulering]
+Gate 4: Markedet likvidt (spread < 5%)?                       [DEAKTIVERET — kopier 1:1]
+Gate 5: Mere end 30 minutter til close?                       [DEAKTIVERET — kortsigtede markeder OK]
+Gate 6: Order-size inden for hard cap?                        [AKTIV]
+Gate 7: Daglig loss limit ikke nået?                          [DEAKTIVERET — kan genaktiveres]
 
 Eksponerer:
   passes_gates(conn, event) → tuple[bool, str]
@@ -39,15 +39,16 @@ _MARKET_CLOSE_BUFFER_MINUTES = 30
 
 
 async def passes_gates(conn: asyncpg.Connection, event: TradeEvent) -> tuple[bool, str]:
-    """Kør alle 7 gates i rækkefølge. Første fejl stopper eksekveringen."""
+    """Kør aktive gates i rækkefølge. Første fejl stopper eksekveringen."""
     checks = [
         _gate1_wallet_followed,
-        _gate2_only_opened,
-        _gate3_not_exposed,
-        _gate4_liquidity,
-        _gate5_market_close,
+        # _gate2_only_opened    — deaktiveret: monitor filtrerer allerede på BUY
+        # _gate3_not_exposed    — deaktiveret: tillader akkumulering i samme marked
+        # _gate4_liquidity      — deaktiveret: kopier 1:1 uden spread-filter
+        # _gate5_market_close   — deaktiveret: kortsigtede markeder skal kopieres
         _gate6_size_cap,
-        _gate7_daily_loss,
+        # _gate7_daily_loss     — deaktiveret: genaktivér ved at uncommente linjen nedenfor
+        # _gate7_daily_loss,
     ]
     for check in checks:
         ok, reason = await check(conn, event)
