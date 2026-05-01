@@ -32,6 +32,8 @@ log = logging.getLogger(__name__)
 GAMMA_BASE = "https://gamma-api.polymarket.com"
 POSITION_SIZE_PCT: str = os.getenv("POSITION_SIZE_PCT", "0.05")
 MAX_DAILY_LOSS: Decimal = Decimal(os.getenv("MAX_DAILY_LOSS", "50"))
+DRY_RUN: bool = os.getenv("DRY_RUN", "true").lower() == "true"
+_DRY_RUN_BALANCE = Decimal("1000")  # Simuleret balance i paper trading mode
 _SIZE_HARD_CAP_PCT = Decimal("0.20")
 _MIN_ORDER_SIZE = Decimal("1.0")
 _MAX_SPREAD = Decimal("0.05")
@@ -245,6 +247,10 @@ async def calculate_size(conn: asyncpg.Connection, wallet_id: int) -> Decimal:
         if row and row["position_size_pct"]
         else Decimal(POSITION_SIZE_PCT)
     )
-    available_cash = await get_clob_balance()
+    # I DRY_RUN mode bruges simuleret balance — ingen CLOB API-kald
+    if DRY_RUN:
+        available_cash = _DRY_RUN_BALANCE
+    else:
+        available_cash = await get_clob_balance()
     size = available_cash * pct
     return min(size, available_cash * _SIZE_HARD_CAP_PCT)
