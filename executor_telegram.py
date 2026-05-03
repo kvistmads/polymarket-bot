@@ -4,6 +4,7 @@ executor_telegram.py — Telegram Bot integration for executor.
 Eksponerer:
   send_telegram(text)                     → None
   send_approval_request(win_rate, total)  → None
+  send_daily_summary(totals, today_count, by_outcome, top_market) → None
   telegram_polling_loop()                 → coroutine (kør som task)
   check_go_live_gate(conn)                → None
 
@@ -15,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from datetime import datetime, timezone
 
 import asyncpg
 import httpx
@@ -81,6 +83,51 @@ async def send_approval_request(win_rate: float, total: int) -> None:
             )
     except Exception:
         log.exception("send_approval_request fejlede")
+
+
+async def send_daily_summary(
+    totals: dict,
+    today_count: int,
+    by_outcome: list[dict],
+    top_market: str | None,
+) -> None:
+    """Send daglig opsummering til Telegram (kaldes kl. 06:00 UTC fra executor.py)."""
+    total = int(totals.get("total") or 0)
+    won = int(totals.get("won_count") or 0)
+    lost = int(totals.get("lost_count") or 0)
+    pending = int(totals.get("pending_count") or 0)
+    total_pnl = float(totals.get("total_pnl") or 0)
+    invested = float(totals.get("total_invested") or 0)
+
+    resolved = won + lost
+    win_rate = won / resolved if resolved > 0 else 0
+    roi = (total_pnl / invested * 100) if invested > 0 else 0
+    pnl_emoji = "📈" if total_pnl >= 0 else "📉"
+    date_str = datetime.now(timezone.utc).strftime("%d/%m/%Y")
+
+    lines = [
+        f"📊 <b>Daglig opsummering</b> — {date_str}",
+        "",
+        f"🏆 <b>Win rate:</b> {win_rate:.1%}  ({won}W / {lost}L / {pending} afventer)",
+        f"{pnl_emoji} <b>Sim. P&amp;L:</b> ${total_pnl:+.2f} USDC  (ROI {roi:+.1f}%)",
+        f"🔢 <b>Trades i dag:</b> {today_count}  |  Total: {total}",
+    ]
+
+    if by_outcome:
+        lines.append("")
+        lines.append("🎯 <b>Win rate per outcome-type:</b>")
+        for row in by_outcome:
+            ot = int(row.get("total") or 0)
+            ow = int(row.get("won_count") or 0)
+            wr = ow / ot if ot > 0 else 0
+            bar = "█" * round(wr * 10) + "░" * (10 - round(wr * 10))
+            lines.append(f"  {row['outcome']:6s} {bar} {wr:.0%}  ({ow}/{ot})")
+
+    if top_market:
+        lines.append("")
+        lines.append(f"🔥 <b>Mest aktivt marked (7d):</b> {top_market[:50]}")
+
+    await send_telegram("\n".join(lines))
 
 
 async def telegram_polling_loop() -> None:
