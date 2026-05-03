@@ -155,6 +155,34 @@ async def _get_market_title(conn: asyncpg.Connection, condition_id: str) -> str:
     return f"{condition_id[:10]}…"
 
 
+def _format_trade_msg(
+    label: str,
+    wallet: str,
+    outcome: str,
+    price: Decimal | None,
+    shares: Decimal | None,
+    title: str,
+) -> str:
+    """Formatér Telegram-besked ved trade execution (paper + live)."""
+    direction = outcome.upper()
+    arrow = "📈" if outcome.lower() in ("up", "yes") else "📉"
+    p = float(price or 0)
+    s = float(shares or 0)
+    invested = s * p                       # USDC brugt
+    max_win = s * 1.0                      # $1/share ved win
+    profit = max_win - invested            # potentiel nettogevinst
+    roi = (profit / invested * 100) if invested > 0 else 0
+    impl_prob = p * 100                    # implicit sandsynlighed = pris i %
+
+    return (
+        f"{label} · <b>{wallet}</b>\n"
+        f"{arrow} <b>{direction}</b> — {title}\n"
+        f"💵 Investeret: ${invested:.2f} USDC ({s:.0f} shares @ ${p:.3f})\n"
+        f"🏆 Max gevinst: ${max_win:.2f} USDC (+{roi:.0f}%)\n"
+        f"📊 Impl. sandsynlighed: {impl_prob:.0f}%"
+    )
+
+
 async def process_trade_event(event: TradeEvent) -> None:
     """Kør gates → siz ordre → eksekvér (paper eller live)."""
     global _last_processed
@@ -180,14 +208,7 @@ async def process_trade_event(event: TradeEvent) -> None:
                 error_msg=None,
             )
             await log_copy_order(conn, event, size, result)
-            price_str = f"${float(event.price_at_event):.3f}" if event.price_at_event else "?"
-            usdc = float(size) * float(event.price_at_event or 0)
-            await send_telegram(
-                f"📄 <b>PAPER</b> — {tag}\n"
-                f"{'📈' if event.outcome.lower() in ('up','yes') else '📉'} "
-                f"<b>{event.outcome}</b> @ {price_str} | {float(size):.0f} shares | ${usdc:.2f} USDC\n"
-                f"📊 {title}"
-            )
+            await send_telegram(_format_trade_msg("📄 PAPER", tag, event.outcome, event.price_at_event, size, title))
             await check_go_live_gate(conn)
             return
 
@@ -198,14 +219,7 @@ async def process_trade_event(event: TradeEvent) -> None:
         await log_copy_order(conn, event, size, result)
 
     if result.status == "filled":
-        usdc = float(result.size_filled or 0) * float(result.price or 0)
-        await send_telegram(
-            f"✅ <b>LIVE FILLED</b> — {tag}\n"
-            f"{'📈' if event.outcome.lower() in ('up','yes') else '📉'} "
-            f"<b>{event.outcome}</b> @ ${float(result.price):.3f} | "
-            f"{float(result.size_filled):.0f} shares | ${usdc:.2f} USDC\n"
-            f"📊 {title}"
-        )
+        await send_telegram(_format_trade_msg("✅ LIVE", tag, event.outcome, result.price, result.size_filled, title))
     else:
         await send_telegram(f"❌ <b>LIVE FEJL</b> — {tag}\n{result.error_msg}")
 
@@ -338,7 +352,7 @@ async def _update_resolved_orders() -> None:
                 continue
 
             async with acquire() as conn:
-                updated = await conn.fetchval(
+                rows_updated = await conn.fetch(
                     """
                     WITH upd AS (
                         UPDATE copy_orders
@@ -352,19 +366,36 @@ async def _update_resolved_orders() -> None:
                         WHERE condition_id = $1
                           AND won IS NULL
                           AND status IN ('paper', 'filled')
-                        RETURNING 1
+                        RETURNING won, pnl_usdc, size_filled, price
                     )
-                    SELECT COUNT(*) FROM upd
+                    SELECT * FROM upd
                     """,
                     condition_id,
                     winning_outcome,
                 )
-            if updated:
+                title = await _get_market_title(conn, condition_id)
+
+            if rows_updated:
+                total_pnl = sum(float(r["pnl_usdc"] or 0) for r in rows_updated)
+                total_invested = sum(
+                    float(r["size_filled"] or 0) * float(r["price"] or 0)
+                    for r in rows_updated
+                )
+                did_win = rows_updated[0]["won"]
+                roi = (total_pnl / total_invested * 100) if total_invested > 0 else 0
+                emoji = "✅" if did_win else "❌"
+                result = "VANDT" if did_win else "TABTE"
                 log.info(
-                    "Resolved %s → vinder: %s  (%d orders opdateret)",
+                    "Resolved %s → vinder: %s  (%d orders, P&L: %+.2f)",
                     condition_id[:12],
                     winning_outcome,
-                    updated,
+                    len(rows_updated),
+                    total_pnl,
+                )
+                await send_telegram(
+                    f"{emoji} <b>{result}:</b> {title}\n"
+                    f"Udfald: {winning_outcome.upper()}\n"
+                    f"Sim. P&amp;L: ${total_pnl:+.2f} USDC  (ROI {roi:+.1f}%)"
                 )
         except asyncio.CancelledError:
             raise
