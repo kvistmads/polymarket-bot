@@ -73,34 +73,39 @@ async def _fetch_market(client: httpx.AsyncClient, condition_id: str) -> dict | 
     return None  # alle forsøg fejlede
 
 
+def _parse_json_field(value: str | list | None) -> list:
+    """Gamma API returnerer outcomes/outcomePrices som JSON-strenge eller lister."""
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    try:
+        parsed = json.loads(value)
+        return parsed if isinstance(parsed, list) else []
+    except (json.JSONDecodeError, TypeError):
+        return []
+
+
 async def _is_resolved(market: dict) -> str | None:
     """
     Returnerer winning outcome (lowercase) hvis markedet er afgjort, ellers None.
 
-    Gamma API bruger enten:
-      - market["resolved"] == True  + outcomePrices  (primær)
-      - market["closed"] == True + outcomePrices ≈ 1.0  (fallback)
+    Gamma API inkluderer kun 'resolved: true' for afklarede markeder.
+    outcomes og outcomePrices kan være JSON-strenge eller lister.
     """
-    outcomes: list = market.get("outcomes") or []
-    outcome_prices: list = market.get("outcomePrices") or []
+    outcomes: list = _parse_json_field(market.get("outcomes"))
+    outcome_prices: list = _parse_json_field(market.get("outcomePrices"))
 
-    # Forsøg 1: eksplicit resolved-flag
-    if market.get("resolved"):
-        for i, price_str in enumerate(outcome_prices):
-            try:
-                if float(price_str) >= 0.99 and i < len(outcomes):
-                    return str(outcomes[i]).lower()
-            except (ValueError, TypeError):
-                continue
+    # Kun afklarede markeder har resolved: true
+    if not market.get("resolved"):
+        return None
 
-    # Forsøg 2: closed market med klar vinder i outcomePrices (settled men felt mangler)
-    if market.get("closed") or not market.get("active", True):
-        for i, price_str in enumerate(outcome_prices):
-            try:
-                if float(price_str) >= 0.99 and i < len(outcomes):
-                    return str(outcomes[i]).lower()
-            except (ValueError, TypeError):
-                continue
+    for i, price_str in enumerate(outcome_prices):
+        try:
+            if float(price_str) >= 0.99 and i < len(outcomes):
+                return str(outcomes[i]).lower()
+        except (ValueError, TypeError):
+            continue
 
     return None
 
