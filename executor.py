@@ -322,8 +322,12 @@ async def _update_resolved_orders() -> None:
             if not market.get("resolved"):
                 continue
 
-            outcomes: list = market.get("outcomes") or []
-            outcome_prices: list = market.get("outcomePrices") or []
+            # outcomes/outcomePrices kan være JSON-strenge eller lister
+            import json as _json
+            raw_outcomes = market.get("outcomes") or []
+            raw_prices = market.get("outcomePrices") or []
+            outcomes: list = _json.loads(raw_outcomes) if isinstance(raw_outcomes, str) else raw_outcomes
+            outcome_prices: list = _json.loads(raw_prices) if isinstance(raw_prices, str) else raw_prices
             winning_outcome: str | None = None
             for i, price_str in enumerate(outcome_prices):
                 if float(price_str) >= 0.99 and i < len(outcomes):

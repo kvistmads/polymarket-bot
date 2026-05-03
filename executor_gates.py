@@ -8,6 +8,7 @@ Gate 4: Markedet likvidt (spread < 5%)?                       [DEAKTIVERET — k
 Gate 5: Mere end 30 minutter til close?                       [DEAKTIVERET — kortsigtede markeder OK]
 Gate 6: Order-size inden for hard cap?                        [AKTIV]
 Gate 7: Daglig loss limit ikke nået?                          [DEAKTIVERET — kan genaktiveres]
+Gate 8: Kun crypto price prediction markets?                  [AKTIV]
 
 Eksponerer:
   passes_gates(conn, event) → tuple[bool, str]
@@ -44,6 +45,7 @@ async def passes_gates(conn: asyncpg.Connection, event: TradeEvent) -> tuple[boo
     """Kør aktive gates i rækkefølge. Første fejl stopper eksekveringen."""
     checks = [
         _gate1_wallet_followed,
+        _gate8_crypto_market,
         # _gate2_only_opened    — deaktiveret: monitor filtrerer allerede på BUY
         # _gate3_not_exposed    — deaktiveret: tillader akkumulering i samme marked
         # _gate4_liquidity      — deaktiveret: kopier 1:1 uden spread-filter
@@ -227,6 +229,66 @@ async def _gate7_daily_loss(
         if pnl <= -MAX_DAILY_LOSS:
             return False, f"daglig tab {pnl:.2f} <= -{MAX_DAILY_LOSS}"
     return True, ""
+
+
+# ── Gate 8 ─────────────────────────────────────────────────────────────────────
+
+# Nøgleord der identificerer et crypto price prediction market.
+# Titlen tjekkes case-insensitivt — ét match er nok til at tillade trade.
+_CRYPTO_KEYWORDS: frozenset[str] = frozenset([
+    # Mønter
+    "bitcoin", "btc",
+    "ethereum", "eth",
+    "solana", "sol",
+    "xrp", "ripple",
+    "dogecoin", "doge",
+    "bnb", "binance",
+    "avalanche", "avax",
+    "cardano", "ada",
+    "polygon", "matic",
+    "chainlink", "link",
+    "litecoin", "ltc",
+    "shiba", "shib",
+    "pepe",
+    "toncoin", "ton",
+    "sui",
+    "aptos", "apt",
+    "near",
+    "arbitrum", "arb",
+    "optimism", "op",
+    # Generiske crypto-termer der dækker price prediction markets
+    "crypto",
+    "altcoin",
+    "defi",
+    "memecoin",
+    "stablecoin",
+    "coinbase",
+    "binance",
+    "bybit",
+    "coinmarketcap",
+    "cmc",
+])
+
+
+async def _gate8_crypto_market(
+    conn: asyncpg.Connection, event: TradeEvent
+) -> tuple[bool, str]:
+    """Tillad kun crypto price prediction markets baseret på markedstitlen."""
+    row = await conn.fetchrow(
+        "SELECT title FROM market_metadata WHERE condition_id = $1",
+        event.condition_id,
+    )
+    title = (row["title"] or "").lower() if row else ""
+    if not title:
+        # Ingen metadata endnu — lad gaten passere og log en advarsel
+        log.warning("Gate 8: ingen market_metadata for %s — lader passere", event.condition_id[:12])
+        return True, ""
+
+    for keyword in _CRYPTO_KEYWORDS:
+        if keyword in title:
+            return True, ""
+
+    return False, f"ikke et crypto-marked: '{title[:60]}'"
 
 
 # ── Position sizing ────────────────────────────────────────────────────────────
