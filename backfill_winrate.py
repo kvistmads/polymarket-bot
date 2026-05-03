@@ -13,6 +13,7 @@ Output: printer løbende progress + afsluttende statistik til stdout.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 
 import asyncpg
@@ -25,7 +26,83 @@ DB_DSN: str = os.getenv("DB_URL", "postgresql://localhost/polymarket").replace(
     "postgresql+asyncpg://", "postgresql://"
 )
 GAMMA_BASE = "https://gamma-api.polymarket.com"
-BATCH_SIZE = 20  # concurrent Gamma API requests
+REQUEST_DELAY = 1.5   # sekunder mellem requests for at undgå 429
+MAX_RETRIES = 3       # antal genforsøg ved 429
+
+_debug_printed = False  # print første API-response én gang til debug
+
+
+async def _fetch_market(client: httpx.AsyncClient, condition_id: str) -> dict | None:
+    """Hent market fra Gamma API med retry ved 429. Returnerer første market eller None."""
+    global _debug_printed
+    for attempt in range(MAX_RETRIES):
+        try:
+            r = await client.get(
+                f"{GAMMA_BASE}/markets",
+                params={"condition_id": condition_id},
+            )
+            if r.status_code == 429:
+                wait = 2 ** attempt  # 1s, 2s, 4s
+                print(f"  ⏳ 429 rate limit — venter {wait}s (forsøg {attempt + 1}/{MAX_RETRIES})")
+                await asyncio.sleep(wait)
+                continue
+            r.raise_for_status()
+            data = r.json()
+        except httpx.HTTPStatusError as e:
+            if attempt < MAX_RETRIES - 1:
+                await asyncio.sleep(1)
+                continue
+            raise e
+
+        markets = data if isinstance(data, list) else [data]
+        if not markets:
+            return None
+
+        # Print første response én gang så vi kan se feltnavnene
+        if not _debug_printed:
+            _debug_printed = True
+            sample = {k: v for k, v in markets[0].items()
+                      if k in ("resolved", "closed", "active", "outcomes",
+                               "outcomePrices", "resolvedBy", "resolutionTime",
+                               "endDateIso", "question")}
+            print(f"\n🔍 DEBUG — første API-response (nøglefelter):\n"
+                  f"  {json.dumps(sample, indent=2)}\n")
+
+        return markets[0]
+
+    return None  # alle forsøg fejlede
+
+
+async def _is_resolved(market: dict) -> str | None:
+    """
+    Returnerer winning outcome (lowercase) hvis markedet er afgjort, ellers None.
+
+    Gamma API bruger enten:
+      - market["resolved"] == True  + outcomePrices  (primær)
+      - market["closed"] == True + outcomePrices ≈ 1.0  (fallback)
+    """
+    outcomes: list = market.get("outcomes") or []
+    outcome_prices: list = market.get("outcomePrices") or []
+
+    # Forsøg 1: eksplicit resolved-flag
+    if market.get("resolved"):
+        for i, price_str in enumerate(outcome_prices):
+            try:
+                if float(price_str) >= 0.99 and i < len(outcomes):
+                    return str(outcomes[i]).lower()
+            except (ValueError, TypeError):
+                continue
+
+    # Forsøg 2: closed market med klar vinder i outcomePrices (settled men felt mangler)
+    if market.get("closed") or not market.get("active", True):
+        for i, price_str in enumerate(outcome_prices):
+            try:
+                if float(price_str) >= 0.99 and i < len(outcomes):
+                    return str(outcomes[i]).lower()
+            except (ValueError, TypeError):
+                continue
+
+    return None
 
 
 async def main() -> None:
@@ -41,43 +118,79 @@ async def main() -> None:
         """
     )
     total_markets = len(rows)
-    print(f"Fandt {total_markets} markeder at tjekke…\n")
+    print(f"Fandt {total_markets} markeder at tjekke…")
+    print(f"Bruger sekventielle requests med {REQUEST_DELAY}s delay for at undgå rate limit.\n")
 
     resolved_count = 0
     updated_orders = 0
     unresolved_count = 0
     error_count = 0
 
-    # Behandl i batches for at undgå at overbelaste Gamma API
     condition_ids = [r["condition_id"] for r in rows]
-    for batch_start in range(0, total_markets, BATCH_SIZE):
-        batch = condition_ids[batch_start : batch_start + BATCH_SIZE]
-        results = await asyncio.gather(
-            *[_check_and_update(conn, cid) for cid in batch],
-            return_exceptions=True,
-        )
-        for cid, result in zip(batch, results):
-            if isinstance(result, Exception):
-                error_count += 1
-                print(f"  ❌ {cid[:12]}… fejl: {result}")
-            elif result == "resolved":
-                resolved_count += 1
-            elif result == "unresolved":
-                unresolved_count += 1
-            elif isinstance(result, int):
-                resolved_count += 1
-                updated_orders += result
 
-        done = min(batch_start + BATCH_SIZE, total_markets)
-        print(f"  [{done}/{total_markets}] resolved={resolved_count} "
-              f"unresolved={unresolved_count} fejl={error_count}")
+    async with httpx.AsyncClient(timeout=15) as client:
+        for i, cid in enumerate(condition_ids):
+            try:
+                market = await _fetch_market(client, cid)
+                if market is None:
+                    unresolved_count += 1
+                else:
+                    winning_outcome = await _is_resolved(market)
+                    if winning_outcome is None:
+                        unresolved_count += 1
+                    else:
+                        updated = await conn.fetchval(
+                            """
+                            WITH upd AS (
+                                UPDATE copy_orders
+                                SET
+                                    won      = (LOWER(outcome) = $2),
+                                    pnl_usdc = CASE
+                                        WHEN LOWER(outcome) = $2
+                                            THEN size_filled * (1 - price)
+                                        ELSE -(size_filled * price)
+                                        END
+                                WHERE condition_id = $1
+                                  AND won IS NULL
+                                  AND status IN ('paper', 'filled')
+                                RETURNING 1
+                            )
+                            SELECT COUNT(*) FROM upd
+                            """,
+                            cid,
+                            winning_outcome,
+                        )
+                        n = int(updated or 0)
+                        resolved_count += 1
+                        updated_orders += n
+                        print(f"  ✅ {cid[:14]}… vinder='{winning_outcome}' → {n} orders opdateret")
+
+            except Exception as exc:
+                error_count += 1
+                print(f"  ❌ {cid[:14]}… fejl: {exc}")
+
+            # Progress hvert 50. marked
+            if (i + 1) % 50 == 0 or (i + 1) == total_markets:
+                print(
+                    f"  [{i+1:>4}/{total_markets}] "
+                    f"resolved={resolved_count}  "
+                    f"unresolved={unresolved_count}  "
+                    f"fejl={error_count}"
+                )
+
+            await asyncio.sleep(REQUEST_DELAY)
+
+            # Pause hvert 100. request for at undgå rate limit
+            if (i + 1) % 100 == 0 and (i + 1) < total_markets:
+                print(f"  ⏸  Pause 15s for at undgå rate limit…")
+                await asyncio.sleep(15)
 
     await conn.close()
 
     # ── Afsluttende statistik ────────────────────────────────────────────────
     print("\n" + "=" * 60)
     print(f"Backfill færdig: {total_markets} markeder tjekket")
-    print(f"  Resolved og opdateret: {resolved_count}")
+    print(f"  Resolved og opdateret: {resolved_count} markeder ({updated_orders} orders)")
     print(f"  Endnu ikke resolved:   {unresolved_count}")
     print(f"  Fejl:                  {error_count}")
     print("=" * 60)
@@ -171,58 +284,6 @@ async def main() -> None:
                 f"{int(row['won_count']):>5}  {int(row['lost_count']):>5}  "
                 f"{wr:>6.1%}  ${float(row['pnl']):>+10.2f}"
             )
-
-
-async def _check_and_update(conn: asyncpg.Connection, condition_id: str) -> str | int:
-    """Tjek Gamma API for ét marked og opdater copy_orders. Returnerer antal opdaterede rows."""
-    async with httpx.AsyncClient(timeout=15) as client:
-        r = await client.get(
-            f"{GAMMA_BASE}/markets",
-            params={"condition_id": condition_id},
-        )
-        r.raise_for_status()
-        data = r.json()
-
-    markets = data if isinstance(data, list) else [data]
-    if not markets:
-        return "unresolved"
-    market = markets[0]
-    if not market.get("resolved"):
-        return "unresolved"
-
-    outcomes: list = market.get("outcomes") or []
-    outcome_prices: list = market.get("outcomePrices") or []
-    winning_outcome: str | None = None
-    for i, price_str in enumerate(outcome_prices):
-        if float(price_str) >= 0.99 and i < len(outcomes):
-            winning_outcome = str(outcomes[i]).lower()
-            break
-
-    if not winning_outcome:
-        return "unresolved"
-
-    updated = await conn.fetchval(
-        """
-        WITH upd AS (
-            UPDATE copy_orders
-            SET
-                won      = (LOWER(outcome) = $2),
-                pnl_usdc = CASE
-                    WHEN LOWER(outcome) = $2
-                        THEN size_filled * (1 - price)
-                    ELSE -(size_filled * price)
-                    END
-            WHERE condition_id = $1
-              AND won IS NULL
-              AND status IN ('paper', 'filled')
-            RETURNING 1
-        )
-        SELECT COUNT(*) FROM upd
-        """,
-        condition_id,
-        winning_outcome,
-    )
-    return int(updated or 0)
 
 
 if __name__ == "__main__":
