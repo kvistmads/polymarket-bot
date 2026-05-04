@@ -56,6 +56,7 @@ POSITION_SIZE_PCT: str = os.getenv("POSITION_SIZE_PCT", "0.05")
 DRY_RUN: bool = os.getenv("DRY_RUN", "true").lower() == "true"
 LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
 GAMMA_BASE: str = "https://gamma-api.polymarket.com"
+CLOB_BASE:  str = "https://clob.polymarket.com"
 
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
@@ -355,7 +356,16 @@ async def win_rate_tracker_loop() -> None:
 
 
 async def _update_resolved_orders() -> None:
-    """Find copy_orders uden won-status og opdater fra Gamma API."""
+    """
+    Find copy_orders uden won-status og opdater via CLOB API.
+
+    CLOB API bruges fordi Gamma API ikke kender condition_ids for
+    de korte Up/Down markeder. CLOB tokens[] har winner: true/false.
+
+    P&L-formel (size_filled = USDC budget, IKKE shares):
+      Vundet:  pnl = size_filled * (1/price - 1)
+      Tabt:    pnl = -size_filled
+    """
     async with acquire() as conn:
         rows = await conn.fetch(
             """
@@ -368,39 +378,32 @@ async def _update_resolved_orders() -> None:
     if not rows:
         return
 
-    log.debug("Tjekker resolution for %d markeder…", len(rows))
+    log.debug("Tjekker resolution for %d markeder via CLOB API…", len(rows))
     for row in rows:
         condition_id: str = row["condition_id"]
         try:
             async with httpx.AsyncClient(timeout=10) as client:
                 r = await client.get(
-                    f"{GAMMA_BASE}/markets",
-                    params={"condition_id": condition_id},
+                    f"{CLOB_BASE}/markets/{condition_id}",
                 )
+                if r.status_code in (404, 400):
+                    continue
                 r.raise_for_status()
-                data = r.json()
+                market = r.json()
 
-            markets = data if isinstance(data, list) else [data]
-            if not markets:
-                continue
-            market = markets[0]
-            if not market.get("resolved"):
+            # Valider at vi fik det rigtige marked
+            if market.get("condition_id") != condition_id:
                 continue
 
-            # outcomes/outcomePrices kan være JSON-strenge eller lister
-            import json as _json
-            raw_outcomes = market.get("outcomes") or []
-            raw_prices = market.get("outcomePrices") or []
-            outcomes: list = _json.loads(raw_outcomes) if isinstance(raw_outcomes, str) else raw_outcomes
-            outcome_prices: list = _json.loads(raw_prices) if isinstance(raw_prices, str) else raw_prices
+            # Find vinder fra tokens[] — winner: true sættes når markedet resolver
             winning_outcome: str | None = None
-            for i, price_str in enumerate(outcome_prices):
-                if float(price_str) >= 0.99 and i < len(outcomes):
-                    winning_outcome = str(outcomes[i]).lower()
+            for token in (market.get("tokens") or []):
+                if token.get("winner") is True:
+                    winning_outcome = str(token.get("outcome", "")).lower()
                     break
 
             if not winning_outcome:
-                continue
+                continue  # Markedet er endnu ikke resolved
 
             async with acquire() as conn:
                 rows_updated = await conn.fetch(
@@ -411,8 +414,8 @@ async def _update_resolved_orders() -> None:
                             won      = (LOWER(outcome) = $2),
                             pnl_usdc = CASE
                                 WHEN LOWER(outcome) = $2
-                                    THEN size_filled * (1 - price)
-                                ELSE -(size_filled * price)
+                                    THEN size_filled * (1.0 / NULLIF(price, 0) - 1.0)
+                                ELSE -size_filled
                                 END
                         WHERE condition_id = $1
                           AND won IS NULL
@@ -429,7 +432,7 @@ async def _update_resolved_orders() -> None:
             if rows_updated:
                 total_pnl = sum(float(r["pnl_usdc"] or 0) for r in rows_updated)
                 total_invested = sum(
-                    float(r["size_filled"] or 0) * float(r["price"] or 0)
+                    float(r["size_filled"] or 0)
                     for r in rows_updated
                 )
                 did_win = rows_updated[0]["won"]
