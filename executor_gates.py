@@ -1,14 +1,21 @@
 """
 executor_gates.py — Gate verifikation for trade executor.
 
-Gate 1: Wallet aktuelt fulgt (unfollowed_at IS NULL)?         [AKTIV]
-Gate 2: Kun 'opened' events?                                  [DEAKTIVERET — filtreres i monitor]
-Gate 3: Ikke allerede eksponeret i markedet?                  [DEAKTIVERET — tillad akkumulering]
-Gate 4: Markedet likvidt (spread < 5%)?                       [DEAKTIVERET — kopier 1:1]
-Gate 5: Mere end 30 minutter til close?                       [DEAKTIVERET — kortsigtede markeder OK]
-Gate 6: Order-size inden for hard cap?                        [AKTIV]
-Gate 7: Daglig loss limit ikke nået?                          [DEAKTIVERET — kan genaktiveres]
-Gate 8: Kun crypto price prediction markets?                  [AKTIV]
+Gate 1:  Wallet aktuelt fulgt (unfollowed_at IS NULL)?         [AKTIV]
+Gate 2:  Kun 'opened' events?                                  [DEAKTIVERET — filtreres i monitor]
+Gate 3:  Ikke allerede eksponeret i markedet?                  [DEAKTIVERET — tillad akkumulering]
+Gate 4:  Markedet likvidt (spread < 5%)?                       [DEAKTIVERET — kopier 1:1]
+Gate 5:  Mere end 30 minutter til close?                       [DEAKTIVERET — kortsigtede markeder OK]
+Gate 6:  Order-size inden for hard cap?                        [AKTIV]
+Gate 7:  Daglig loss limit ikke nået?                          [DEAKTIVERET — kan genaktiveres]
+Gate 8:  Kun crypto price prediction markets?                  [AKTIV]
+Gate 9:  Minimum indgangspris ≥ MIN_ENTRY_PRICE?              [AKTIV]
+Gate 10: Skip UP outcome?                                      [AKTIV]
+
+Data-analyse (maj 2026, 1.586 unikke markeder):
+  Trades over 40 cent: DOWN +$3.45/trade, YES +$4.25, NO +$5.19
+  UP trades: konsekvent negativt på tværs af alle prisgrupper
+  Trades under 40 cent: alle outcome-typer mister penge i snit
 
 Eksponerer:
   passes_gates(conn, event) → tuple[bool, str]
@@ -40,12 +47,17 @@ _MIN_ORDER_SIZE = Decimal("1.0")
 _MAX_SPREAD = Decimal("0.05")
 _MARKET_CLOSE_BUFFER_MINUTES = 30
 
+# Gate 9 — minimum indgangspris (konfigurerbar via .env)
+_MIN_ENTRY_PRICE: Decimal = Decimal(os.getenv("MIN_ENTRY_PRICE", "0.40"))
+
 
 async def passes_gates(conn: asyncpg.Connection, event: TradeEvent) -> tuple[bool, str]:
     """Kør aktive gates i rækkefølge. Første fejl stopper eksekveringen."""
     checks = [
         _gate1_wallet_followed,
         _gate8_crypto_market,
+        _gate9_min_entry_price,
+        _gate10_skip_up,
         # _gate2_only_opened    — deaktiveret: monitor filtrerer allerede på BUY
         # _gate3_not_exposed    — deaktiveret: tillader akkumulering i samme marked
         # _gate4_liquidity      — deaktiveret: kopier 1:1 uden spread-filter
@@ -289,6 +301,53 @@ async def _gate8_crypto_market(
             return True, ""
 
     return False, f"ikke et crypto-marked: '{title[:60]}'"
+
+
+# ── Gate 9 ─────────────────────────────────────────────────────────────────────
+
+
+async def _gate9_min_entry_price(
+    conn: asyncpg.Connection, event: TradeEvent
+) -> tuple[bool, str]:
+    """
+    Tillad kun trades med indgangspris ≥ MIN_ENTRY_PRICE (default 0.40).
+
+    Data-begrundelse (maj 2026):
+      Trades over 40 cent er profitable på tværs af Down/Yes/No.
+      Trades under 40 cent er konsekvent negative — selv de tilsyneladende
+      profitable longshot-Yes-trades er for sjældne til at gøre en forskel.
+
+    Konfigurerbar via .env: MIN_ENTRY_PRICE=0.40
+    """
+    if event.price_at_event is None:
+        log.warning("Gate 9: ingen pris på event %d — lader passere", event.id)
+        return True, ""
+    if event.price_at_event < _MIN_ENTRY_PRICE:
+        return False, (
+            f"indgangspris {float(event.price_at_event):.3f} "
+            f"< minimum {float(_MIN_ENTRY_PRICE):.2f}"
+        )
+    return True, ""
+
+
+# ── Gate 10 ────────────────────────────────────────────────────────────────────
+
+
+async def _gate10_skip_up(
+    conn: asyncpg.Connection, event: TradeEvent
+) -> tuple[bool, str]:
+    """
+    Skip alle 'Up' outcome trades.
+
+    Data-begrundelse (maj 2026):
+      Up-trades er negative på tværs af alle prisgrupper.
+      Over 40 cent: -$0.73 avg P&L, 64% win (break-even: ~50%, burde være positivt
+      men systematisk timing-lag og spread gør dem marginalt negative).
+      Under 40 cent: klart negative.
+    """
+    if event.outcome.strip().lower() == "up":
+        return False, f"outcome='Up' — filtreret af Gate 10"
+    return True, ""
 
 
 # ── Position sizing ────────────────────────────────────────────────────────────
