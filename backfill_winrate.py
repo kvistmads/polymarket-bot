@@ -1,11 +1,16 @@
 """
-backfill_winrate.py — Éngangs-backfill af won/pnl_usdc for alle copy_orders.
+backfill_winrate.py — Backfill af won/pnl_usdc for alle copy_orders via CLOB API.
 
-Henter resolution-status fra Gamma API for alle condition_ids i copy_orders
-og opdaterer won + pnl_usdc kolonner. Kør én gang efter migration 012.
+Gamma API kender ikke condition_ids for de 15-minutters/1-times Up-or-Down markeder.
+Polymarket CLOB API gør — hvert market response indeholder tokens[] med winner: bool.
 
-Brug:
-    docker compose run --rm executor python backfill_winrate.py
+Korrekt P&L-logik (size_filled = USDC budget, IKKE shares):
+  - Vundet:  shares = size_filled / price
+             pnl    = shares * 1.0 - size_filled = size_filled * (1/price - 1)
+  - Tabt:    pnl    = -size_filled
+
+Kør EFTER migration 013 (dedup af copy_orders):
+    docker compose run --rm executor python -u backfill_winrate.py
 
 Output: printer løbende progress + afsluttende statistik til stdout.
 """
@@ -15,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+from decimal import Decimal
 
 import asyncpg
 import httpx
@@ -25,124 +31,57 @@ load_dotenv()
 DB_DSN: str = os.getenv("DB_URL", "postgresql://localhost/polymarket").replace(
     "postgresql+asyncpg://", "postgresql://"
 )
-GAMMA_BASE = "https://gamma-api.polymarket.com"
-REQUEST_DELAY = 1.5   # sekunder mellem requests for at undgå 429
-MAX_RETRIES = 3       # antal genforsøg ved 429
+CLOB_BASE    = "https://clob.polymarket.com"
+REQUEST_DELAY = 0.3   # sekunder mellem requests (CLOB er mere tolerant end Gamma)
+MAX_RETRIES   = 3
+BATCH_PAUSE_EVERY = 200  # pause hvert N. request
+BATCH_PAUSE_SEC   = 10   # sekunder pause
 
-_debug_printed = False  # print første API-response én gang til debug
 
-
-async def _fetch_market(client: httpx.AsyncClient, condition_id: str) -> dict | None:
+async def _fetch_clob_market(client: httpx.AsyncClient, condition_id: str) -> dict | None:
     """
-    Hent market fra Gamma API.
+    Hent market fra CLOB API.
 
-    Prøver to opslag i rækkefølge:
-      1. ?condition_id=X  — virker for normale markeder
-      2. ?clob_token_id=X — virker for 15-minutters Up/Down markets, hvor
-         activity API returnerer CLOB token ID i stedet for condition_id
-
-    Returnerer første market der matcher, eller None.
+    Endpoint: GET /markets/{condition_id}
+    Returnerer dict med 'tokens' array eller None ved fejl/ikke-fundet.
     """
-    global _debug_printed
-
-    for param_key in ("condition_id", "clob_token_id"):
-        for attempt in range(MAX_RETRIES):
-            try:
-                r = await client.get(
-                    f"{GAMMA_BASE}/markets",
-                    params={param_key: condition_id},
-                )
-                if r.status_code == 429:
-                    wait = 2 ** attempt
-                    print(f"  ⏳ 429 rate limit — venter {wait}s (forsøg {attempt + 1}/{MAX_RETRIES})")
-                    await asyncio.sleep(wait)
-                    continue
-                r.raise_for_status()
-                data = r.json()
-            except httpx.HTTPStatusError as e:
-                if attempt < MAX_RETRIES - 1:
-                    await asyncio.sleep(1)
-                    continue
-                raise e
-
-            markets = data if isinstance(data, list) else [data]
-            if not markets:
-                break  # Prøv næste param_key
-
-            # Valider at det returnerede marked faktisk matcher vores condition_id
-            # (Gamma API kan returnere random markeder ved ugyldigt condition_id)
-            m = markets[0]
-            returned_cid = m.get("conditionId", "")
-            returned_tokens_raw = m.get("clobTokenIds") or m.get("clobTokenIds", "[]")
-            try:
-                returned_tokens = (
-                    json.loads(returned_tokens_raw)
-                    if isinstance(returned_tokens_raw, str)
-                    else returned_tokens_raw or []
-                )
-            except (json.JSONDecodeError, TypeError):
-                returned_tokens = []
-
-            # Kun accepter match hvis condition_id rent faktisk stemmer overens
-            id_match = (
-                returned_cid == condition_id
-                or condition_id in returned_tokens
-            )
-            if not id_match:
-                break  # Intet reelt match — prøv næste param_key
-
-            # Print første gyldige response til debug
-            if not _debug_printed:
-                _debug_printed = True
-                sample = {k: v for k, v in m.items()
-                          if k in ("resolved", "closed", "active", "outcomes",
-                                   "outcomePrices", "resolvedBy", "resolutionTime",
-                                   "endDateIso", "question", "conditionId")}
-                print(f"\n🔍 DEBUG — første match via '{param_key}' (nøglefelter):\n"
-                      f"  {json.dumps(sample, indent=2)}\n")
-
-            return m
-
-        # Vent kort mellem de to opslag
-        await asyncio.sleep(0.2)
-
-    return None  # Ingen parametre gav et gyldigt match
-
-
-def _parse_json_field(value: str | list | None) -> list:
-    """Gamma API returnerer outcomes/outcomePrices som JSON-strenge eller lister."""
-    if value is None:
-        return []
-    if isinstance(value, list):
-        return value
-    try:
-        parsed = json.loads(value)
-        return parsed if isinstance(parsed, list) else []
-    except (json.JSONDecodeError, TypeError):
-        return []
-
-
-async def _is_resolved(market: dict) -> str | None:
-    """
-    Returnerer winning outcome (lowercase) hvis markedet er afgjort, ellers None.
-
-    Gamma API inkluderer kun 'resolved: true' for afklarede markeder.
-    outcomes og outcomePrices kan være JSON-strenge eller lister.
-    """
-    outcomes: list = _parse_json_field(market.get("outcomes"))
-    outcome_prices: list = _parse_json_field(market.get("outcomePrices"))
-
-    # Kun afklarede markeder har resolved: true
-    if not market.get("resolved"):
-        return None
-
-    for i, price_str in enumerate(outcome_prices):
+    for attempt in range(MAX_RETRIES):
         try:
-            if float(price_str) >= 0.99 and i < len(outcomes):
-                return str(outcomes[i]).lower()
-        except (ValueError, TypeError):
-            continue
+            r = await client.get(f"{CLOB_BASE}/markets/{condition_id}", timeout=10)
+            if r.status_code == 429:
+                wait = 2 ** attempt
+                print(f"  ⏳ 429 — venter {wait}s (forsøg {attempt + 1}/{MAX_RETRIES})")
+                await asyncio.sleep(wait)
+                continue
+            if r.status_code == 404:
+                return None
+            r.raise_for_status()
+            data = r.json()
+            # Valider at vi fik det rigtige marked
+            if data.get("condition_id") == condition_id:
+                return data
+            return None
+        except httpx.TimeoutException:
+            if attempt < MAX_RETRIES - 1:
+                await asyncio.sleep(1)
+                continue
+            return None
+        except httpx.HTTPStatusError:
+            return None
+    return None
 
+
+def _get_winner(market: dict) -> str | None:
+    """
+    Returnerer winning outcome (lowercase) fra CLOB market response.
+
+    CLOB tokens[] har winner: true på det vindende outcome når markedet er resolved.
+    Returnerer None hvis ingen token har winner=true (market stadig åben/uafgjort).
+    """
+    tokens = market.get("tokens") or []
+    for token in tokens:
+        if token.get("winner") is True:
+            return str(token.get("outcome", "")).lower()
     return None
 
 
@@ -159,27 +98,48 @@ async def main() -> None:
         """
     )
     total_markets = len(rows)
-    print(f"Fandt {total_markets} markeder at tjekke…")
-    print(f"Bruger sekventielle requests med {REQUEST_DELAY}s delay for at undgå rate limit.\n")
+    print(f"Fandt {total_markets} markeder at tjekke via CLOB API…")
+    print(f"Delay: {REQUEST_DELAY}s per request, pause {BATCH_PAUSE_SEC}s hvert {BATCH_PAUSE_EVERY}. request\n")
 
-    resolved_count = 0
-    updated_orders = 0
+    resolved_count  = 0
+    updated_orders  = 0
     unresolved_count = 0
-    error_count = 0
+    not_found_count = 0
+    error_count     = 0
 
     condition_ids = [r["condition_id"] for r in rows]
 
-    async with httpx.AsyncClient(timeout=15) as client:
+    # Print første market som debug
+    debug_done = False
+
+    async with httpx.AsyncClient() as client:
         for i, cid in enumerate(condition_ids):
             try:
-                market = await _fetch_market(client, cid)
+                market = await _fetch_clob_market(client, cid)
+
                 if market is None:
-                    unresolved_count += 1
+                    not_found_count += 1
                 else:
-                    winning_outcome = await _is_resolved(market)
+                    # Debug: print første fundne market
+                    if not debug_done:
+                        debug_done = True
+                        tokens_summary = [
+                            {"outcome": t.get("outcome"), "price": t.get("price"), "winner": t.get("winner")}
+                            for t in (market.get("tokens") or [])
+                        ]
+                        print(f"\n🔍 DEBUG — første CLOB-market:")
+                        print(f"   question: {market.get('question', '?')}")
+                        print(f"   closed:   {market.get('closed')}")
+                        print(f"   tokens:   {json.dumps(tokens_summary)}\n")
+
+                    winning_outcome = _get_winner(market)
                     if winning_outcome is None:
                         unresolved_count += 1
                     else:
+                        # Opdater copy_orders med korrekt P&L
+                        # size_filled = USDC investeret (ikke shares)
+                        # won:  pnl = size_filled * (1/price - 1)   [shares * 1.0 - cost]
+                        # lost: pnl = -size_filled                   [mister hele investeringen]
                         updated = await conn.fetchval(
                             """
                             WITH upd AS (
@@ -188,8 +148,8 @@ async def main() -> None:
                                     won      = (LOWER(outcome) = $2),
                                     pnl_usdc = CASE
                                         WHEN LOWER(outcome) = $2
-                                            THEN size_filled * (1 - price)
-                                        ELSE -(size_filled * price)
+                                            THEN size_filled * (1.0 / NULLIF(price, 0) - 1.0)
+                                        ELSE -size_filled
                                         END
                                 WHERE condition_id = $1
                                   AND won IS NULL
@@ -213,40 +173,42 @@ async def main() -> None:
             # Progress hvert 50. marked
             if (i + 1) % 50 == 0 or (i + 1) == total_markets:
                 print(
-                    f"  [{i+1:>4}/{total_markets}] "
+                    f"  [{i+1:>4}/{total_markets}]  "
                     f"resolved={resolved_count}  "
                     f"unresolved={unresolved_count}  "
+                    f"not_found={not_found_count}  "
                     f"fejl={error_count}"
                 )
 
             await asyncio.sleep(REQUEST_DELAY)
 
-            # Pause hvert 100. request for at undgå rate limit
-            if (i + 1) % 100 == 0 and (i + 1) < total_markets:
-                print(f"  ⏸  Pause 15s for at undgå rate limit…")
-                await asyncio.sleep(15)
+            # Pause hvert BATCH_PAUSE_EVERY. request
+            if (i + 1) % BATCH_PAUSE_EVERY == 0 and (i + 1) < total_markets:
+                print(f"\n  ⏸  Pause {BATCH_PAUSE_SEC}s…\n")
+                await asyncio.sleep(BATCH_PAUSE_SEC)
 
     await conn.close()
 
-    # ── Afsluttende statistik ────────────────────────────────────────────────
-    print("\n" + "=" * 60)
+    # ── Afsluttende statistik ────────────────────────────────────────────────────
+    print("\n" + "=" * 65)
     print(f"Backfill færdig: {total_markets} markeder tjekket")
-    print(f"  Resolved og opdateret: {resolved_count} markeder ({updated_orders} orders)")
-    print(f"  Endnu ikke resolved:   {unresolved_count}")
-    print(f"  Fejl:                  {error_count}")
-    print("=" * 60)
+    print(f"  Resolved og opdateret:   {resolved_count} markeder ({updated_orders} orders)")
+    print(f"  Stadig uafgjort:         {unresolved_count}")
+    print(f"  Ikke fundet i CLOB API:  {not_found_count}")
+    print(f"  Fejl:                    {error_count}")
+    print("=" * 65)
 
-    # Hent og print aggregeret win-rate
+    # ── Aggregeret statistik ─────────────────────────────────────────────────────
     conn2 = await asyncpg.connect(dsn=DB_DSN)
     stats = await conn2.fetchrow(
         """
         SELECT
-            COUNT(*)                                       AS total,
-            COUNT(*) FILTER (WHERE won = true)             AS won_count,
-            COUNT(*) FILTER (WHERE won = false)            AS lost_count,
-            COUNT(*) FILTER (WHERE won IS NULL)            AS pending_count,
-            COALESCE(SUM(pnl_usdc), 0)                    AS total_pnl,
-            COALESCE(SUM(size_filled * price), 0)          AS total_invested
+            COUNT(*)                                            AS total,
+            COUNT(*) FILTER (WHERE won = true)                  AS won_count,
+            COUNT(*) FILTER (WHERE won = false)                 AS lost_count,
+            COUNT(*) FILTER (WHERE won IS NULL)                 AS pending_count,
+            COALESCE(SUM(pnl_usdc), 0)                         AS total_pnl,
+            COALESCE(SUM(size_filled), 0)                       AS total_invested
         FROM copy_orders
         WHERE status IN ('paper', 'filled')
         """
@@ -254,11 +216,11 @@ async def main() -> None:
     by_outcome = await conn2.fetch(
         """
         SELECT
-            UPPER(outcome)                                 AS outcome,
-            COUNT(*)                                       AS total,
-            COUNT(*) FILTER (WHERE won = true)             AS won_count,
-            ROUND(AVG(price)::numeric, 4)                  AS avg_entry_price,
-            ROUND(AVG(pnl_usdc)::numeric, 2)               AS avg_pnl
+            UPPER(outcome)                                       AS outcome,
+            COUNT(*)                                             AS total,
+            COUNT(*) FILTER (WHERE won = true)                   AS won_count,
+            ROUND(AVG(price)::numeric, 4)                        AS avg_entry_price,
+            ROUND(AVG(pnl_usdc)::numeric, 2)                     AS avg_pnl
         FROM copy_orders
         WHERE won IS NOT NULL
         GROUP BY UPPER(outcome)
@@ -268,11 +230,12 @@ async def main() -> None:
     daily = await conn2.fetch(
         """
         SELECT
-            DATE(timestamp)                                AS day,
-            COUNT(*)                                       AS trades,
-            COUNT(*) FILTER (WHERE won = true)             AS won_count,
-            COUNT(*) FILTER (WHERE won = false)            AS lost_count,
-            ROUND(COALESCE(SUM(pnl_usdc), 0)::numeric, 2) AS pnl
+            DATE(timestamp)                                      AS day,
+            COUNT(*)                                             AS trades,
+            COUNT(*) FILTER (WHERE won = true)                   AS won_count,
+            COUNT(*) FILTER (WHERE won = false)                  AS lost_count,
+            ROUND(COALESCE(SUM(size_filled), 0)::numeric, 0)     AS invested,
+            ROUND(COALESCE(SUM(pnl_usdc), 0)::numeric, 2)        AS pnl
         FROM copy_orders
         WHERE status IN ('paper', 'filled')
         GROUP BY DATE(timestamp)
@@ -282,21 +245,21 @@ async def main() -> None:
     )
     await conn2.close()
 
-    total = int(stats["total"] or 0)
-    won = int(stats["won_count"] or 0)
-    lost = int(stats["lost_count"] or 0)
-    pending = int(stats["pending_count"] or 0)
+    total    = int(stats["total"] or 0)
+    won      = int(stats["won_count"] or 0)
+    lost     = int(stats["lost_count"] or 0)
+    pending  = int(stats["pending_count"] or 0)
     total_pnl = float(stats["total_pnl"] or 0)
-    invested = float(stats["total_invested"] or 0)
+    invested  = float(stats["total_invested"] or 0)
     resolved_total = won + lost
     win_rate = won / resolved_total if resolved_total > 0 else 0
-    roi = (total_pnl / invested * 100) if invested > 0 else 0
+    roi      = (total_pnl / invested * 100) if invested > 0 else 0
 
     print(f"\n📊 SAMLET STATISTIK ({total} trades)")
-    print(f"   Win rate:       {win_rate:.1%}  ({won}W / {lost}L / {pending} afventer)")
-    print(f"   Sim. P&L:       ${total_pnl:+,.2f} USDC")
-    print(f"   Investeret:     ${invested:,.2f} USDC (sim.)")
-    print(f"   ROI:            {roi:+.2f}%")
+    print(f"   Win rate:        {win_rate:.1%}  ({won}W / {lost}L / {pending} afventer)")
+    print(f"   Sim. P&L:        ${total_pnl:+,.2f} USDC")
+    print(f"   Sim. investeret: ${invested:,.2f} USDC")
+    print(f"   ROI:             {roi:+.2f}%")
 
     if by_outcome:
         print("\n🎯 WIN RATE PER OUTCOME-TYPE:")
@@ -315,15 +278,16 @@ async def main() -> None:
 
     if daily:
         print("\n📅 DAGLIG TREND (seneste 7 dage):")
-        print(f"   {'Dato':<12}  {'Trades':>7}  {'W':>5}  {'L':>5}  {'Win%':>6}  {'P&L':>12}")
-        print("   " + "-" * 56)
+        print(f"   {'Dato':<12}  {'Trades':>7}  {'W':>5}  {'L':>5}  {'Win%':>6}  {'Invest':>10}  {'P&L':>12}")
+        print("   " + "-" * 70)
         for row in daily:
             ot = int(row["won_count"]) + int(row["lost_count"])
             wr = int(row["won_count"]) / ot if ot > 0 else 0
             print(
                 f"   {str(row['day']):<12}  {int(row['trades']):>7}  "
                 f"{int(row['won_count']):>5}  {int(row['lost_count']):>5}  "
-                f"{wr:>6.1%}  ${float(row['pnl']):>+10.2f}"
+                f"{wr:>6.1%}  ${float(row['invested']):>8,.0f}  "
+                f"${float(row['pnl']):>+10.2f}"
             )
 
 
