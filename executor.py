@@ -286,12 +286,17 @@ async def log_copy_order(
     result: OrderResult,
 ) -> None:
     """Indsæt i copy_orders og opdater daily_stats atomisk (ON CONFLICT DO UPDATE)."""
+    # size_requested og size_filled er begge USDC-budget (ikke shares).
+    # shares = size_filled / price  — beregnes ved P&L-opgørelse.
+    # ON CONFLICT på trade_event_id: migration 014 tilføjede UNIQUE index —
+    # hvis executor behandler det samme event to gange, ignoreres anden indsætning.
     await conn.execute(
         """
         INSERT INTO copy_orders
             (source_wallet_id, trade_event_id, condition_id, outcome, side,
              size_requested, size_filled, price, status, error_msg)
         VALUES ($1, $2, $3, $4, 'buy', $5, $6, $7, $8, $9)
+        ON CONFLICT (trade_event_id) DO NOTHING
         """,
         event.wallet_id,
         event.id,
@@ -372,7 +377,7 @@ async def _update_resolved_orders() -> None:
             SELECT DISTINCT condition_id
             FROM copy_orders
             WHERE won IS NULL AND status IN ('paper', 'filled')
-            LIMIT 50
+            LIMIT 200
             """
         )
     if not rows:

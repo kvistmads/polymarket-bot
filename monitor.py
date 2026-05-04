@@ -60,6 +60,7 @@ log = logging.getLogger("monitor")
 # ── endpoints ──────────────────────────────────────────────────────────────────
 DATA_API  = "https://data-api.polymarket.com"
 GAMMA_API = "https://gamma-api.polymarket.com"
+CLOB_API  = "https://clob.polymarket.com"
 
 HEADERS = {
     "User-Agent": "WalletWatcher/2.0",
@@ -92,24 +93,33 @@ async def fetch_activity_async(wallet: str, limit: int = 20) -> list[dict]:
     return await loop.run_in_executor(None, _fetch_activity, wallet, limit)
 
 
-def _fetch_gamma_market(condition_id: str) -> dict | None:
-    """Hent market-metadata fra Gamma API for condition_id."""
+def _fetch_clob_market(condition_id: str) -> dict | None:
+    """
+    Hent market-metadata fra CLOB API for condition_id.
+
+    CLOB API kender alle Polymarket condition_ids inkl. de korte
+    Up/Down og "above X" markeder som Gamma API ikke genkender.
+    Returnerer dict med question, market_slug og tokens[] eller None.
+    """
     try:
         r = requests.get(
-            f"{GAMMA_API}/markets/{condition_id}",
-            headers=HEADERS,
+            f"{CLOB_API}/markets/{condition_id}",
             timeout=10,
         )
         if r.ok:
-            return r.json()
+            data = r.json()
+            # Valider at vi fik det rigtige marked
+            if data.get("condition_id") == condition_id:
+                return data
     except Exception as exc:
-        log.warning("Gamma API fejl for %s: %s", condition_id[:12], exc)
+        log.warning("CLOB API fejl for %s: %s", condition_id[:12], exc)
     return None
 
 
-async def fetch_gamma_market_async(condition_id: str) -> dict | None:
+async def fetch_clob_market_async(condition_id: str) -> dict | None:
+    """Async wrapper — kører HTTP-kald i executor pool."""
     loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, _fetch_gamma_market, condition_id)
+    return await loop.run_in_executor(None, _fetch_clob_market, condition_id)
 
 
 # ── DB helpers ─────────────────────────────────────────────────────────────────
@@ -125,12 +135,53 @@ async def _get_or_create_wallet_id(conn: asyncpg.Connection, address: str) -> in
     return int(new_id)
 
 
+async def _upsert_market_metadata_from_clob(
+    conn: asyncpg.Connection,
+    condition_id: str,
+    market: dict,
+) -> None:
+    """
+    Gem market-metadata fra CLOB API response.
+
+    CLOB format:
+      question     → title
+      market_slug  → slug
+      tokens[]     → outcomes (["Up","Down"]) + clob_token_ids (["123..","456.."])
+    """
+    tokens: list[dict] = market.get("tokens") or []
+    outcomes   = [t.get("outcome", "") for t in tokens]
+    token_ids  = [str(t.get("token_id", "")) for t in tokens]
+    title      = (market.get("question") or "")[:200]
+    slug       = market.get("market_slug") or market.get("slug", "")
+
+    if not title:
+        return  # Ingen titel — spring over
+
+    await conn.execute(
+        """
+        INSERT INTO market_metadata (condition_id, title, slug, outcomes, clob_token_ids)
+        VALUES ($1, $2, $3, $4::jsonb, $5::jsonb)
+        ON CONFLICT (condition_id) DO UPDATE SET
+            title          = EXCLUDED.title,
+            slug           = EXCLUDED.slug,
+            outcomes       = EXCLUDED.outcomes,
+            clob_token_ids = EXCLUDED.clob_token_ids
+        WHERE EXCLUDED.title IS NOT NULL AND EXCLUDED.title != ''
+        """,
+        condition_id,
+        title,
+        slug,
+        json.dumps(outcomes),
+        json.dumps(token_ids),
+    )
+
+
 async def _upsert_market_metadata(
     conn: asyncpg.Connection,
     condition_id: str,
     market: dict,
 ) -> None:
-    """Gem market-metadata fra Gamma API — ON CONFLICT DO NOTHING."""
+    """Gem market-metadata fra Gamma API (fallback — bruges ikke længere primært)."""
     raw_outcomes  = market.get("outcomes", [])
     raw_token_ids = market.get("clobTokenIds", "")
 
@@ -247,15 +298,15 @@ async def process_new_trade(
         wallet[:6], wallet[-4:], title, outcome, price, usdc, dt,
     )
 
-    # Hent market-metadata fra Gamma API (nødvendig for Gate 4)
-    market = await fetch_gamma_market_async(condition_id)
+    # Hent market-metadata fra CLOB API (kender alle condition_ids inkl. Up/Down markeder)
+    clob_market = await fetch_clob_market_async(condition_id)
 
     try:
         async with acquire() as conn:
-            if market:
-                await _upsert_market_metadata(conn, condition_id, market)
+            if clob_market:
+                await _upsert_market_metadata_from_clob(conn, condition_id, clob_market)
             elif title:
-                # Gamma API utilgængelig — gem title fra activity API som fallback
+                # CLOB API utilgængelig — gem title fra activity API som fallback
                 await conn.execute(
                     """
                     INSERT INTO market_metadata (condition_id, title, slug, outcomes, clob_token_ids)
