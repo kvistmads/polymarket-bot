@@ -155,29 +155,51 @@ async def _get_market_title(conn: asyncpg.Connection, condition_id: str) -> str:
     return f"{condition_id[:10]}…"
 
 
+def _split_title(title: str) -> tuple[str, str]:
+    """
+    Opdel markedstitel i navn + tidsvindue.
+    "Bitcoin Up or Down - May 4, 10:00AM-10:15AM ET"
+      → ("Bitcoin Up or Down", "May 4, 10:00AM-10:15AM ET")
+    Returnerer (title, "") hvis formatet ikke genkendes.
+    """
+    parts = title.rsplit(" - ", 1)
+    if len(parts) == 2:
+        return parts[0].strip(), parts[1].strip()
+    return title, ""
+
+
 def _format_trade_msg(
     label: str,
     wallet: str,
     outcome: str,
     price: Decimal | None,
-    shares: Decimal | None,
+    usdc_budget: Decimal | None,
     title: str,
 ) -> str:
-    """Formatér Telegram-besked ved trade execution (paper + live)."""
+    """Formatér Telegram-besked ved trade execution (paper + live).
+
+    usdc_budget er USDC til investering (ikke shares).
+    Shares = usdc_budget / price.
+    """
     direction = outcome.upper()
     arrow = "📈" if outcome.lower() in ("up", "yes") else "📉"
     p = float(price or 0)
-    s = float(shares or 0)
-    invested = s * p                       # USDC brugt
-    max_win = s * 1.0                      # $1/share ved win
-    profit = max_win - invested            # potentiel nettogevinst
+    budget = float(usdc_budget or 0)
+    shares = (budget / p) if p > 0 else 0      # antal shares der købes
+    invested = shares * p                       # = budget (afrundingsfejl minimeres)
+    max_win = shares * 1.0                      # $1/share ved win
+    profit = max_win - invested
     roi = (profit / invested * 100) if invested > 0 else 0
-    impl_prob = p * 100                    # implicit sandsynlighed = pris i %
+    impl_prob = p * 100
+
+    market_name, time_window = _split_title(title)
+    time_line = f"⏱ {time_window}\n" if time_window else ""
 
     return (
         f"{label} · <b>{wallet}</b>\n"
-        f"{arrow} <b>{direction}</b> — {title}\n"
-        f"💵 Investeret: ${invested:.2f} USDC ({s:.0f} shares @ ${p:.3f})\n"
+        f"{arrow} <b>{direction}</b> — {market_name}\n"
+        f"{time_line}"
+        f"💵 Investeret: ${invested:.2f} USDC ({shares:.0f} shares @ ${p:.3f}/share)\n"
         f"🏆 Max gevinst: ${max_win:.2f} USDC (+{roi:.0f}%)\n"
         f"📊 Impl. sandsynlighed: {impl_prob:.0f}%"
     )
