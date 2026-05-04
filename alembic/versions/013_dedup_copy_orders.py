@@ -1,13 +1,8 @@
-"""013_dedup_copy_orders — Ryd op i duplikater og tilføj unik constraint.
+"""013_dedup_copy_orders — Placeholder (det egentlige dedup sker i migration 014).
 
-Baggrund:
-  monitor.py's deduplication fejlede for trades uden transactionHash.
-  Resulterede i op til 59 identiske copy_orders per trade-tick.
-
-Hvad denne migration gør:
-  1. Sletter duplikat-rækker fra copy_orders (beholder den rækkke med lavest id)
-  2. Tilføjer UNIQUE index på (condition_id, outcome, price, wallet_id, timestamp)
-     — forhindrer fremtidige duplikater på DB-niveau
+Migration 013 forsøgte dedup med forkert kolonnenavn (wallet_id → source_wallet_id)
+og med timestamp i GROUP BY (virker ikke da duplikater har ms-forskellig timestamp).
+Migration 014 laver den korrekte dedup.
 
 Revision ID: 013
 Revises: 012
@@ -26,25 +21,9 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    # ── Trin 1: Slet duplikat-rækker — behold lavest id per unik kombination ──
-    op.execute("""
-        DELETE FROM copy_orders
-        WHERE id NOT IN (
-            SELECT MIN(id)
-            FROM copy_orders
-            GROUP BY condition_id, outcome, price, wallet_id, timestamp
-        )
-    """)
-
-    # ── Trin 2: Tilføj unique index så det ikke kan ske igen ──
-    # CONCURRENTLY er ikke tilladt inde i en transaktion, men Alembic kører
-    # i autocommit-mode ved CREATE INDEX CONCURRENTLY — vi bruger standard her
-    # og accepterer kort lock (tabellen er lille efter dedup).
-    op.execute("""
-        CREATE UNIQUE INDEX ix_copy_orders_dedup
-            ON copy_orders (condition_id, outcome, price, wallet_id, timestamp)
-    """)
+    # Ingen ændringer — migration 014 håndterer det korrekte dedup
+    pass
 
 
 def downgrade() -> None:
-    op.execute("DROP INDEX IF EXISTS ix_copy_orders_dedup")
+    pass
