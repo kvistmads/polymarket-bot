@@ -147,7 +147,12 @@ async def _upsert_market_metadata(
         """
         INSERT INTO market_metadata (condition_id, title, slug, outcomes, clob_token_ids)
         VALUES ($1, $2, $3, $4::jsonb, $5::jsonb)
-        ON CONFLICT (condition_id) DO NOTHING
+        ON CONFLICT (condition_id) DO UPDATE SET
+            title         = EXCLUDED.title,
+            slug          = EXCLUDED.slug,
+            outcomes      = EXCLUDED.outcomes,
+            clob_token_ids = EXCLUDED.clob_token_ids
+        WHERE EXCLUDED.title IS NOT NULL AND EXCLUDED.title != ''
         """,
         condition_id,
         market.get("question") or market.get("title", ""),
