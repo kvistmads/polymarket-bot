@@ -33,44 +33,80 @@ _debug_printed = False  # print første API-response én gang til debug
 
 
 async def _fetch_market(client: httpx.AsyncClient, condition_id: str) -> dict | None:
-    """Hent market fra Gamma API med retry ved 429. Returnerer første market eller None."""
+    """
+    Hent market fra Gamma API.
+
+    Prøver to opslag i rækkefølge:
+      1. ?condition_id=X  — virker for normale markeder
+      2. ?clob_token_id=X — virker for 15-minutters Up/Down markets, hvor
+         activity API returnerer CLOB token ID i stedet for condition_id
+
+    Returnerer første market der matcher, eller None.
+    """
     global _debug_printed
-    for attempt in range(MAX_RETRIES):
-        try:
-            r = await client.get(
-                f"{GAMMA_BASE}/markets",
-                params={"condition_id": condition_id},
+
+    for param_key in ("condition_id", "clob_token_id"):
+        for attempt in range(MAX_RETRIES):
+            try:
+                r = await client.get(
+                    f"{GAMMA_BASE}/markets",
+                    params={param_key: condition_id},
+                )
+                if r.status_code == 429:
+                    wait = 2 ** attempt
+                    print(f"  ⏳ 429 rate limit — venter {wait}s (forsøg {attempt + 1}/{MAX_RETRIES})")
+                    await asyncio.sleep(wait)
+                    continue
+                r.raise_for_status()
+                data = r.json()
+            except httpx.HTTPStatusError as e:
+                if attempt < MAX_RETRIES - 1:
+                    await asyncio.sleep(1)
+                    continue
+                raise e
+
+            markets = data if isinstance(data, list) else [data]
+            if not markets:
+                break  # Prøv næste param_key
+
+            # Valider at det returnerede marked faktisk matcher vores condition_id
+            # (Gamma API kan returnere random markeder ved ugyldigt condition_id)
+            m = markets[0]
+            returned_cid = m.get("conditionId", "")
+            returned_tokens_raw = m.get("clobTokenIds") or m.get("clobTokenIds", "[]")
+            try:
+                returned_tokens = (
+                    json.loads(returned_tokens_raw)
+                    if isinstance(returned_tokens_raw, str)
+                    else returned_tokens_raw or []
+                )
+            except (json.JSONDecodeError, TypeError):
+                returned_tokens = []
+
+            # Kun accepter match hvis condition_id rent faktisk stemmer overens
+            id_match = (
+                returned_cid == condition_id
+                or condition_id in returned_tokens
             )
-            if r.status_code == 429:
-                wait = 2 ** attempt  # 1s, 2s, 4s
-                print(f"  ⏳ 429 rate limit — venter {wait}s (forsøg {attempt + 1}/{MAX_RETRIES})")
-                await asyncio.sleep(wait)
-                continue
-            r.raise_for_status()
-            data = r.json()
-        except httpx.HTTPStatusError as e:
-            if attempt < MAX_RETRIES - 1:
-                await asyncio.sleep(1)
-                continue
-            raise e
+            if not id_match:
+                break  # Intet reelt match — prøv næste param_key
 
-        markets = data if isinstance(data, list) else [data]
-        if not markets:
-            return None
+            # Print første gyldige response til debug
+            if not _debug_printed:
+                _debug_printed = True
+                sample = {k: v for k, v in m.items()
+                          if k in ("resolved", "closed", "active", "outcomes",
+                                   "outcomePrices", "resolvedBy", "resolutionTime",
+                                   "endDateIso", "question", "conditionId")}
+                print(f"\n🔍 DEBUG — første match via '{param_key}' (nøglefelter):\n"
+                      f"  {json.dumps(sample, indent=2)}\n")
 
-        # Print første response én gang så vi kan se feltnavnene
-        if not _debug_printed:
-            _debug_printed = True
-            sample = {k: v for k, v in markets[0].items()
-                      if k in ("resolved", "closed", "active", "outcomes",
-                               "outcomePrices", "resolvedBy", "resolutionTime",
-                               "endDateIso", "question")}
-            print(f"\n🔍 DEBUG — første API-response (nøglefelter):\n"
-                  f"  {json.dumps(sample, indent=2)}\n")
+            return m
 
-        return markets[0]
+        # Vent kort mellem de to opslag
+        await asyncio.sleep(0.2)
 
-    return None  # alle forsøg fejlede
+    return None  # Ingen parametre gav et gyldigt match
 
 
 def _parse_json_field(value: str | list | None) -> list:
