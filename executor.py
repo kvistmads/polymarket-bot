@@ -155,6 +155,26 @@ async def _get_market_title(conn: asyncpg.Connection, condition_id: str) -> str:
     return f"{condition_id[:10]}…"
 
 
+_COIN_ABBR: dict[str, str] = {
+    "bitcoin": "BTC",
+    "ethereum": "ETH",
+    "solana": "SOL",
+    "xrp": "XRP",
+    "dogecoin": "DOGE",
+    "bnb": "BNB",
+    "avalanche": "AVAX",
+    "cardano": "ADA",
+    "polygon": "MATIC",
+    "chainlink": "LINK",
+    "litecoin": "LTC",
+    "shiba": "SHIB",
+    "pepe": "PEPE",
+    "toncoin": "TON",
+    "sui": "SUI",
+    "near": "NEAR",
+}
+
+
 def _split_title(title: str) -> tuple[str, str]:
     """
     Opdel markedstitel i navn + tidsvindue.
@@ -166,6 +186,16 @@ def _split_title(title: str) -> tuple[str, str]:
     if len(parts) == 2:
         return parts[0].strip(), parts[1].strip()
     return title, ""
+
+
+def _coin_name(market_name: str) -> str:
+    """Konvertér "Bitcoin Up or Down" → "BTC Up or Down" via præfiks-match."""
+    lower = market_name.lower()
+    for coin, abbr in _COIN_ABBR.items():
+        if lower.startswith(coin):
+            rest = market_name[len(coin):]   # " Up or Down"
+            return f"{abbr}{rest}"
+    return market_name
 
 
 def _format_trade_msg(
@@ -193,15 +223,14 @@ def _format_trade_msg(
     impl_prob = p * 100
 
     market_name, time_window = _split_title(title)
-    time_line = f"⏱ {time_window}\n" if time_window else ""
+    coin_name = _coin_name(market_name)
+    time_part = f" · {time_window}" if time_window else ""
 
     return (
         f"{label} · <b>{wallet}</b>\n"
-        f"{arrow} <b>{direction}</b> — {market_name}\n"
-        f"{time_line}"
-        f"💵 Investeret: ${invested:.2f} USDC ({shares:.0f} shares @ ${p:.3f}/share)\n"
-        f"🏆 Max gevinst: ${max_win:.2f} USDC (+{roi:.0f}%)\n"
-        f"📊 Impl. sandsynlighed: {impl_prob:.0f}%"
+        f"{arrow} <b>{direction}</b> — {coin_name}{time_part}\n"
+        f"💵 ${invested:.2f} USDC ({shares:.0f} sha. @ ${p:.3f})\n"
+        f"🏆 Max: ${max_win:.2f} USDC (+{roi:.0f}%) · {impl_prob:.0f}% sandsynlighed"
     )
 
 
