@@ -188,6 +188,24 @@ async def _insert_trade_event(
 
 # ── activity processing ────────────────────────────────────────────────────────
 
+def _dedup_key(trade: dict) -> str:
+    """
+    Generer en unik nøgle til deduplicering af activity-trades.
+
+    Bruger transactionHash når den er tilgængelig.
+    Fallback: sammensæt nøgle af condition_id + outcome + price + timestamp
+    — denne kombination er unik for hvert trade-tick.
+    """
+    tx = trade.get("transactionHash", "")
+    if tx:
+        return tx
+    cid     = trade.get("conditionId") or trade.get("condition_id") or trade.get("market", "")
+    outcome = trade.get("outcome", "")
+    price   = trade.get("price", "")
+    ts      = trade.get("timestamp", "")
+    return f"synthetic:{cid}:{outcome}:{price}:{ts}"
+
+
 def _extract_condition_id(trade: dict) -> str | None:
     """Udtræk condition_id fra activity-trade — prøv flere felt-navne."""
     for key in ("conditionId", "condition_id", "market", "marketId"):
@@ -344,13 +362,11 @@ async def main(wallets: list[str]) -> int:
                     # Find nye trades (reversed = ældste først)
                     new_trades = [
                         t for t in trades
-                        if t.get("transactionHash", "") not in seen
+                        if _dedup_key(t) not in seen
                     ]
 
                     for trade in reversed(new_trades):
-                        tx = trade.get("transactionHash", "")
-                        if tx:
-                            seen.add(tx)
+                        seen.add(_dedup_key(trade))  # Altid tilføj — også uden transactionHash
 
                         if wallet_id and DB_URL:
                             await process_new_trade(wallet, wallet_id, trade)
