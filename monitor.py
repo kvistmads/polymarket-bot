@@ -220,7 +220,7 @@ async def process_new_trade(
     size     = float(trade.get("size",     0) or 0)
     price    = float(trade.get("price",    0) or 0)
     usdc     = float(trade.get("usdcSize", 0) or 0)
-    title    = (trade.get("title") or "")[:60]
+    title    = (trade.get("title") or "")[:120]
     ts       = trade.get("timestamp", 0)
     dt       = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%H:%M UTC") if ts else "?"
 
@@ -236,6 +236,19 @@ async def process_new_trade(
         async with acquire() as conn:
             if market:
                 await _upsert_market_metadata(conn, condition_id, market)
+            elif title:
+                # Gamma API utilgængelig — gem title fra activity API som fallback
+                await conn.execute(
+                    """
+                    INSERT INTO market_metadata (condition_id, title, slug, outcomes, clob_token_ids)
+                    VALUES ($1, $2, '', '[]'::jsonb, '[]'::jsonb)
+                    ON CONFLICT (condition_id) DO UPDATE SET
+                        title = EXCLUDED.title
+                    WHERE EXCLUDED.title IS NOT NULL AND EXCLUDED.title != ''
+                    """,
+                    condition_id,
+                    title,
+                )
             await _insert_trade_event(conn, wallet_id, condition_id, outcome, size, price)
         log.info("  ✅ trade_event skrevet — executor behandler nu")
         return True
