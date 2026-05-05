@@ -19,6 +19,8 @@ services:
     build: .
     command: python monitor.py
     restart: always
+    ports:
+      - "8080:8080"   # Health endpoint — til UptimeRobot
     depends_on:
       postgres:
         condition: service_healthy
