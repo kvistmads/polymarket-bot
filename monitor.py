@@ -36,6 +36,8 @@ load_dotenv()
 
 DB_URL: str | None = os.getenv("DB_URL")
 LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
+_TELEGRAM_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
+_TELEGRAM_CHAT:  str = os.getenv("TELEGRAM_CHAT_ID", "")
 
 # ── wallet config ──────────────────────────────────────────────────────────────
 _followed_wallets_env = os.getenv("FOLLOWED_WALLETS", "")
@@ -67,6 +69,22 @@ HEADERS = {
     "Origin":     "https://polymarket.com",
     "Referer":    "https://polymarket.com/",
 }
+
+
+# ── Telegram helper ────────────────────────────────────────────────────────────
+
+async def _send_telegram(text: str) -> None:
+    """Send simpel Telegram-besked (aiohttp-fri — bruger requests i executor pool)."""
+    if not _TELEGRAM_TOKEN or not _TELEGRAM_CHAT:
+        return
+    import aiohttp
+    url = f"https://api.telegram.org/bot{_TELEGRAM_TOKEN}/sendMessage"
+    try:
+        async with aiohttp.ClientSession() as s:
+            await s.post(url, json={"chat_id": _TELEGRAM_CHAT, "text": text,
+                                    "parse_mode": "HTML"}, timeout=aiohttp.ClientTimeout(total=10))
+    except Exception as exc:
+        log.warning("Telegram send fejl: %s", exc)
 
 
 # ── REST helpers ───────────────────────────────────────────────────────────────
@@ -365,6 +383,14 @@ async def main(wallets: list[str]) -> int:
     log.info("=" * 60)
 
     health_runner = await _start_health_server()
+
+    # Startup-notifikation til Telegram
+    wallet_short = ", ".join(f"{w[:6]}…{w[-4:]}" for w in wallets)
+    await _send_telegram(
+        f"👁 <b>Monitor genstartet</b>\n"
+        f"Wallets: {wallet_short}\n"
+        f"Tid: {datetime.now(timezone.utc).strftime('%d/%m %H:%M UTC')}"
+    )
 
     # ── per-wallet state ──
     wallet_seen:     dict[str, set[str]] = {}  # wallet -> set af transactionHash
