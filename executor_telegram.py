@@ -130,8 +130,17 @@ async def send_daily_summary(
     await send_telegram("\n".join(lines))
 
 
+# Kommando-handlers registreret af executor.py
+_command_handlers: dict[str, object] = {}
+
+
+def register_command(cmd: str, handler: object) -> None:
+    """Registrér en async handler for en Telegram-kommando (f.eks. '/portfolio')."""
+    _command_handlers[cmd] = handler
+
+
 async def telegram_polling_loop() -> None:
-    """Long-polling loop til Telegram callback_data (go_live / stay_paper)."""
+    """Long-polling loop til Telegram callback_data og tekst-kommandoer."""
     if not TELEGRAM_BOT_TOKEN:
         return
     offset = 0
@@ -143,24 +152,37 @@ async def telegram_polling_loop() -> None:
                     params={
                         "offset": offset,
                         "timeout": 30,
-                        "allowed_updates": ["callback_query"],
+                        "allowed_updates": ["callback_query", "message"],
                     },
                 )
                 data = r.json()
             for update in data.get("result", []):
                 offset = update["update_id"] + 1
+
+                # Håndtér inline-knapper (go_live / stay_paper)
                 cb = update.get("callback_query")
-                if not cb:
+                if cb:
+                    action = cb.get("data")
+                    if action == "go_live":
+                        _dry_run_state["active"] = False
+                        log.info("🚀 Go-live godkendt via Telegram — DRY_RUN deaktiveret")
+                        await send_telegram("✅ <b>Live trading aktiveret!</b> DRY_RUN=false")
+                    elif action == "stay_paper":
+                        await send_telegram("📄 Paper trading fortsætter.")
                     continue
-                action = cb.get("data")
-                if action == "go_live":
-                    _dry_run_state["active"] = False
-                    log.info("🚀 Go-live godkendt via Telegram — DRY_RUN deaktiveret")
-                    await send_telegram(
-                        "✅ <b>Live trading aktiveret!</b> DRY_RUN=false"
-                    )
-                elif action == "stay_paper":
-                    await send_telegram("📄 Paper trading fortsætter.")
+
+                # Håndtér tekst-kommandoer (/portfolio osv.)
+                msg = update.get("message", {})
+                text = (msg.get("text") or "").strip()
+                if text.startswith("/"):
+                    cmd = text.split()[0].lower().split("@")[0]  # /portfolio@botname → /portfolio
+                    handler = _command_handlers.get(cmd)
+                    if handler:
+                        try:
+                            await handler()  # type: ignore[operator]
+                        except Exception:
+                            log.exception("Kommando-handler %s fejlede", cmd)
+
         except asyncio.CancelledError:
             return
         except Exception:

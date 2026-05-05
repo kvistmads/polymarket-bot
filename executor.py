@@ -39,6 +39,7 @@ from executor_gates import calculate_size, passes_gates
 from executor_telegram import (
     check_go_live_gate,
     inject_dry_run_state,
+    register_command,
     send_daily_summary,
     send_telegram,
     telegram_polling_loop,
@@ -463,6 +464,111 @@ async def _update_resolved_orders() -> None:
             log.exception("Kunne ikke resolve condition_id=%s", condition_id[:12])
 
 
+# ── Portfolio kommando (/portfolio) ─────────────────────────────────────────────
+
+_CLOB_BASE = "https://clob.polymarket.com"
+
+
+async def _fetch_end_date(session: httpx.AsyncClient, condition_id: str) -> str:
+    """Hent udløbsdato for et marked fra CLOB API. Returnerer formateret streng."""
+    try:
+        r = await session.get(f"{_CLOB_BASE}/markets/{condition_id}", timeout=8)
+        if r.is_success:
+            data = r.json()
+            end_iso = data.get("end_date_iso") or data.get("game_start_time", "")
+            if end_iso:
+                dt = datetime.fromisoformat(end_iso.replace("Z", "+00:00"))
+                now = datetime.now(timezone.utc)
+                status = "⌛" if dt < now else "⏰"
+                return f"{status} {dt.strftime('%d/%m %H:%M UTC')}"
+    except Exception:
+        pass
+    return "?"
+
+
+async def _portfolio_command_handler() -> None:
+    """Byg og send live portfolio-oversigt til Telegram."""
+    log.info("/portfolio kommando modtaget")
+    await send_telegram("🔄 Henter portfolio…")
+
+    try:
+        async with acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT
+                    w.address                          AS wallet,
+                    co.condition_id,
+                    COALESCE(mm.title, co.condition_id[:16]) AS title,
+                    co.outcome,
+                    SUM(co.size_filled)                AS invested,
+                    COUNT(*)                           AS num_trades,
+                    MIN(co.timestamp)                  AS first_trade
+                FROM copy_orders co
+                JOIN wallets w ON w.id = co.source_wallet_id
+                LEFT JOIN market_metadata mm ON mm.condition_id = co.condition_id
+                WHERE co.won IS NULL
+                  AND co.timestamp >= NOW() - INTERVAL '7 days'
+                GROUP BY w.address, co.condition_id, mm.title, co.outcome
+                ORDER BY w.address, invested DESC
+                """
+            )
+    except Exception:
+        log.exception("Portfolio DB-fejl")
+        await send_telegram("❌ Portfolio-fejl — kunne ikke hente data fra DB.")
+        return
+
+    if not rows:
+        await send_telegram("📂 <b>Portfolio</b>\n\nIngen åbne positioner de seneste 7 dage.")
+        return
+
+    # Gruppér per wallet
+    wallets: dict[str, list] = {}
+    for r in rows:
+        wallets.setdefault(r["wallet"], []).append(r)
+
+    # Hent udløbsdatoer parallelt (maks 20 unikke markets)
+    unique_cids = list({r["condition_id"] for r in rows})[:20]
+    end_dates: dict[str, str] = {}
+    async with httpx.AsyncClient() as session:
+        tasks = {cid: _fetch_end_date(session, cid) for cid in unique_cids}
+        for cid, task in tasks.items():
+            end_dates[cid] = await task
+
+    now_str = datetime.now(timezone.utc).strftime("%d/%m %H:%M UTC")
+    total_positions = len(rows)
+    total_invested = sum(float(r["invested"]) for r in rows)
+
+    lines = [
+        f"📂 <b>Live Portfolio</b> — {now_str}",
+        f"Åbne positioner: <b>{total_positions}</b>  |  Investeret: <b>${total_invested:.2f}</b>",
+    ]
+
+    for wallet, positions in wallets.items():
+        wallet_invested = sum(float(p["invested"]) for p in positions)
+        lines.append("")
+        lines.append(f"👛 <b>{wallet[:6]}…{wallet[-4:]}</b>  (${wallet_invested:.2f} investeret)")
+
+        for i, p in enumerate(positions[:15], 1):  # maks 15 per wallet
+            title = (p["title"] or "Ukendt marked")[:45]
+            invested = float(p["invested"])
+            outcome = p["outcome"] or "?"
+            end = end_dates.get(p["condition_id"], "?")
+            lines.append(f"  {i}. {title}")
+            lines.append(f"     {outcome} • ${invested:.2f} • {end}")
+
+        if len(positions) > 15:
+            lines.append(f"  … og {len(positions) - 15} flere positioner")
+
+    # Telegram maks 4096 tegn — split hvis nødvendigt
+    msg = "\n".join(lines)
+    if len(msg) <= 4096:
+        await send_telegram(msg)
+    else:
+        await send_telegram(msg[:4090] + "\n…")
+
+    log.info("/portfolio sendt — %d positioner", total_positions)
+
+
 # ── Daily summary ───────────────────────────────────────────────────────────────
 
 
@@ -561,6 +667,9 @@ async def main() -> None:
 
     await get_pool()
     health_runner = await _start_health_server()
+
+    # Registrér Telegram-kommandoer
+    register_command("/portfolio", _portfolio_command_handler)
 
     # Startup-notifikation til Telegram
     mode = "🧪 PAPER" if _dry_run_state["active"] else "🔴 LIVE"
