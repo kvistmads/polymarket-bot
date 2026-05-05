@@ -498,7 +498,7 @@ async def _portfolio_command_handler() -> None:
                 SELECT
                     w.address                          AS wallet,
                     co.condition_id,
-                    COALESCE(mm.title, co.condition_id[:16]) AS title,
+                    COALESCE(mm.title, LEFT(co.condition_id, 16)) AS title,
                     co.outcome,
                     SUM(co.size_filled)                AS invested,
                     COUNT(*)                           AS num_trades,
