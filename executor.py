@@ -26,6 +26,7 @@ import signal
 import time
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from zoneinfo import ZoneInfo
 
 import asyncpg
 import httpx
@@ -466,22 +467,30 @@ async def _update_resolved_orders() -> None:
 
 
 async def daily_summary_loop() -> None:
-    """Send Telegram-dagsoversigt kl. 06:00 UTC hver dag."""
+    """Send Telegram-dagsoversigt kl. 06:00 dansk tid (Europe/Copenhagen) hver dag."""
+    _cph = ZoneInfo("Europe/Copenhagen")
     while True:
-        now = datetime.now(timezone.utc)
+        now = datetime.now(_cph)
         next_run = now.replace(hour=6, minute=0, second=0, microsecond=0)
         if next_run <= now:
             next_run += timedelta(days=1)
         wait_secs = (next_run - now).total_seconds()
-        log.info("Næste dagsoversigt om %.1f timer", wait_secs / 3600)
+        log.info("Næste dagsoversigt om %.1f timer (kl. 06:00 CEST)", wait_secs / 3600)
         try:
             await asyncio.sleep(wait_secs)
         except asyncio.CancelledError:
             return
-        try:
-            await _build_and_send_daily_summary()
-        except Exception:
-            log.exception("Dagsoversigt fejlede")
+
+        # Retry-logik: prøv op til 5 gange med 5 minutters mellemrum
+        for attempt in range(1, 6):
+            try:
+                await _build_and_send_daily_summary()
+                log.info("Dagsoversigt sendt ✅")
+                break
+            except Exception:
+                log.exception("Dagsoversigt fejlede (forsøg %d/5)", attempt)
+                if attempt < 5:
+                    await asyncio.sleep(300)  # vent 5 min før næste forsøg
 
 
 async def _build_and_send_daily_summary() -> None:

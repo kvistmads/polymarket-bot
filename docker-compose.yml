@@ -18,7 +18,7 @@ services:
   monitor:
     build: .
     command: python monitor.py
-    restart: unless-stopped
+    restart: always
     depends_on:
       postgres:
         condition: service_healthy
@@ -39,7 +39,7 @@ services:
   executor:
     build: .
     command: python executor.py
-    restart: unless-stopped
+    restart: always
     depends_on:
       postgres:
         condition: service_healthy
