@@ -562,6 +562,14 @@ async def main() -> None:
     await get_pool()
     health_runner = await _start_health_server()
 
+    # Startup-notifikation til Telegram
+    mode = "🧪 PAPER" if _dry_run_state["active"] else "🔴 LIVE"
+    await send_telegram(
+        f"🚀 <b>Executor genstartet</b>\n"
+        f"Tilstand: {mode}\n"
+        f"Tid: {datetime.now(timezone.utc).strftime('%d/%m %H:%M UTC')}"
+    )
+
     loop = asyncio.get_event_loop()
     listen_task = loop.create_task(listen_loop())
     polling_task = loop.create_task(telegram_polling_loop())
