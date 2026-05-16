@@ -8,18 +8,19 @@ Gate 4:  Markedet likvidt (spread < 5%)?                       [DEAKTIVERET — 
 Gate 5:  Mere end 30 minutter til close?                       [DEAKTIVERET — kortsigtede markeder OK]
 Gate 6:  Order-size inden for hard cap?                        [AKTIV]
 Gate 7:  Daglig loss limit ikke nået?                          [DEAKTIVERET — kan genaktiveres]
-Gate 8:  Kun crypto price prediction markets?                  [AKTIV]
-Gate 9:  Minimum indgangspris ≥ MIN_ENTRY_PRICE?              [AKTIV]
-Gate 10: Skip UP outcome?                                      [AKTIV]
+Gate 8:  Kun crypto price prediction markets?                  [DEAKTIVERET — ny wallet kan handle sports/politik]
+Gate 9:  Minimum indgangspris ≥ MIN_ENTRY_PRICE?              [DEAKTIVERET — ny wallet kan handle longshots]
+Gate 10: Skip UP outcome?                                      [DEAKTIVERET — UP-filter var specifik for gammel wallet]
 
-Data-analyse (maj 2026, 1.586 unikke markeder):
-  Trades over 40 cent: DOWN +$3.45/trade, YES +$4.25, NO +$5.19
-  UP trades: konsekvent negativt på tværs af alle prisgrupper
-  Trades under 40 cent: alle outcome-typer mister penge i snit
+Sizing-strategi (maj 2026):
+  Proportionel tilstand (foretrukket): spejler andelen af den fulgte wallets
+  estimerede bankroll. Kræver wallet_scores.estimated_bankroll i DB (køres via
+  filter.py scan + follow).
+  Fallback: fast POSITION_SIZE_PCT af vores balance.
 
 Eksponerer:
   passes_gates(conn, event) → tuple[bool, str]
-  calculate_size(conn, wallet_id) → Decimal
+  calculate_size(conn, wallet_id, event) → Decimal
 """
 
 from __future__ import annotations
@@ -55,9 +56,6 @@ async def passes_gates(conn: asyncpg.Connection, event: TradeEvent) -> tuple[boo
     """Kør aktive gates i rækkefølge. Første fejl stopper eksekveringen."""
     checks = [
         _gate1_wallet_followed,
-        _gate8_crypto_market,
-        _gate9_min_entry_price,
-        _gate10_skip_up,
         # _gate2_only_opened    — deaktiveret: monitor filtrerer allerede på BUY
         # _gate3_not_exposed    — deaktiveret: tillader akkumulering i samme marked
         # _gate4_liquidity      — deaktiveret: kopier 1:1 uden spread-filter
@@ -65,6 +63,9 @@ async def passes_gates(conn: asyncpg.Connection, event: TradeEvent) -> tuple[boo
         _gate6_size_cap,
         # _gate7_daily_loss     — deaktiveret: genaktivér ved at uncommente linjen nedenfor
         # _gate7_daily_loss,
+        # _gate8_crypto_market  — deaktiveret: ny wallet handler sports/politik
+        # _gate9_min_entry_price — deaktiveret: ny wallet handler longshots
+        # _gate10_skip_up       — deaktiveret: UP-filter var specifik for gammel wallet
     ]
     for check in checks:
         ok, reason = await check(conn, event)
@@ -218,7 +219,7 @@ async def _gate6_size_cap(
     conn: asyncpg.Connection, event: TradeEvent
 ) -> tuple[bool, str]:
     try:
-        size = await calculate_size(conn, event.wallet_id)
+        size = await calculate_size(conn, event.wallet_id, event)
     except Exception:
         log.exception("Gate 6 size-beregning fejlede")
         return False, "size-beregning fejlede"
@@ -353,25 +354,76 @@ async def _gate10_skip_up(
 # ── Position sizing ────────────────────────────────────────────────────────────
 
 
-async def calculate_size(conn: asyncpg.Connection, wallet_id: int) -> Decimal:
-    """Beregn ordre-størrelse baseret på per-wallet override eller global pct.
+async def calculate_size(
+    conn: asyncpg.Connection,
+    wallet_id: int,
+    event: TradeEvent | None = None,
+) -> Decimal:
+    """Beregn ordrestørrelse — proportionel eller fast pct.
 
-    Hard cap: 20% af tilgængeligt cash.
+    Proportionel tilstand (foretrukket):
+      Kræver wallet_scores.estimated_bankroll i DB + event.new_size + event.price_at_event.
+      Spejler den fulgte wallets andel: de sætter X% af deres bankroll → vi sætter X% af vores.
+      Eks: de sætter $10K ud af $100K bankroll (10%) → vi sætter 10% af vores $1.000 = $100.
+
+    Fallback — fast pct:
+      Bruges hvis bankroll-data mangler eller event-pris er ukendt.
+      Bruger per-wallet override (followed_wallets.position_size_pct) eller global POSITION_SIZE_PCT.
+
+    Hard cap: 20% af tilgængeligt cash uanset beregningsmetode.
     """
-    row = await conn.fetchrow(
+    # Hent vores tilgængelige balance
+    if DRY_RUN:
+        available_cash = _DRY_RUN_BALANCE
+    else:
+        available_cash = await get_clob_balance()
+
+    hard_cap = available_cash * _SIZE_HARD_CAP_PCT
+
+    # ── Proportionel sizing ──────────────────────────────────────────────────
+    if (
+        event is not None
+        and event.new_size > 0
+        and event.price_at_event is not None
+        and event.price_at_event > 0
+    ):
+        bankroll_row = await conn.fetchrow(
+            "SELECT estimated_bankroll FROM wallet_scores WHERE wallet_id = $1",
+            wallet_id,
+        )
+        if bankroll_row and bankroll_row["estimated_bankroll"]:
+            their_bankroll = Decimal(str(bankroll_row["estimated_bankroll"]))
+            if their_bankroll > 0:
+                their_trade_usd = event.new_size * event.price_at_event
+                ratio = their_trade_usd / their_bankroll
+                size = available_cash * ratio
+                size = min(size, hard_cap)
+                if size >= _MIN_ORDER_SIZE:
+                    log.debug(
+                        "Proportionel sizing: bankroll=$%.2f, trade=$%.2f, "
+                        "ratio=%.4f → vores size=$%.2f",
+                        float(their_bankroll),
+                        float(their_trade_usd),
+                        float(ratio),
+                        float(size),
+                    )
+                    return size
+                log.debug(
+                    "Proportionel size $%.2f < min $%.2f — falder tilbage til fast pct",
+                    float(size),
+                    float(_MIN_ORDER_SIZE),
+                )
+
+    # ── Fallback: fast pct ───────────────────────────────────────────────────
+    fw_row = await conn.fetchrow(
         "SELECT position_size_pct FROM followed_wallets "
         "WHERE wallet_id = $1 AND unfollowed_at IS NULL",
         wallet_id,
     )
     pct = (
-        Decimal(str(row["position_size_pct"]))
-        if row and row["position_size_pct"]
+        Decimal(str(fw_row["position_size_pct"]))
+        if fw_row and fw_row["position_size_pct"]
         else Decimal(POSITION_SIZE_PCT)
     )
-    # I DRY_RUN mode bruges simuleret balance — ingen CLOB API-kald
-    if DRY_RUN:
-        available_cash = _DRY_RUN_BALANCE
-    else:
-        available_cash = await get_clob_balance()
     size = available_cash * pct
-    return min(size, available_cash * _SIZE_HARD_CAP_PCT)
+    return min(size, hard_cap)

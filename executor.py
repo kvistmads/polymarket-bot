@@ -251,7 +251,7 @@ async def process_trade_event(event: TradeEvent) -> None:
             log.info("[%s] Gate afviste event %d: %s", tag, event.id, reason)
             return
 
-        size = await calculate_size(conn, event.wallet_id)
+        size = await calculate_size(conn, event.wallet_id, event)
         title = await _get_market_title(conn, event.condition_id)
 
         if _dry_run_state["active"]:
