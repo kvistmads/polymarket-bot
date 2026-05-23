@@ -34,7 +34,7 @@ from aiohttp import web
 from dotenv import load_dotenv
 
 from db import acquire, close_pool, get_pool
-from executor_clob import submit_to_clob
+from executor_clob import sell_from_clob, submit_to_clob
 from executor_gates import calculate_size, passes_gates
 from executor_telegram import (
     check_go_live_gate,
@@ -237,10 +237,118 @@ def _format_trade_msg(
     )
 
 
+async def _process_sell_signal(event: TradeEvent) -> None:
+    """Luk vores copy-position når fulgt wallet sælger (paper + live).
+
+    Finder seneste åbne copy_order for samme wallet + marked + outcome,
+    beregner P&L ud fra buy-pris og walletens salgspris, opdaterer status='sold'.
+    """
+    tag = event.wallet_label or event.wallet_address[:8]
+    log.info("[%s] SELL SIGNAL condition=%s outcome=%s", tag, event.condition_id[:12], event.outcome)
+
+    async with acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT id, size_filled, price
+            FROM copy_orders
+            WHERE source_wallet_id = $1
+              AND condition_id      = $2
+              AND outcome           = $3
+              AND status IN ('paper', 'filled')
+            ORDER BY timestamp DESC
+            LIMIT 1
+            """,
+            event.wallet_id,
+            event.condition_id,
+            event.outcome,
+        )
+
+        if not row:
+            log.info("[%s] Ingen åben copy_order — sell_signal ignoreres", tag)
+            return
+
+        order_id    = row["id"]
+        size_filled = Decimal(str(row["size_filled"] or 0))  # USDC investeret
+        buy_price   = Decimal(str(row["price"] or 0))
+        sell_price  = event.price_at_event or buy_price
+
+        # Shares = USDC investeret / købspris
+        shares = (size_filled / buy_price) if buy_price > 0 else Decimal("0")
+        pnl    = (sell_price - buy_price) * shares if buy_price > 0 else None
+        won    = bool(pnl > 0) if pnl is not None else None
+
+        title = await _get_market_title(conn, event.condition_id)
+
+        if _dry_run_state["active"]:
+            await conn.execute(
+                """
+                UPDATE copy_orders
+                   SET status         = 'sold',
+                       sell_price     = $2,
+                       sell_timestamp = now(),
+                       pnl_usdc       = $3,
+                       won            = $4
+                 WHERE id = $1
+                """,
+                order_id, sell_price, pnl, won,
+            )
+            emoji = "📈" if won else "📉"
+            pnl_str = f"${float(pnl):+.2f}" if pnl is not None else "?"
+            await send_telegram(
+                f"📤 <b>PAPER EXIT</b> — {tag}\n"
+                f"{emoji} {event.outcome.upper()} solgt @ ${float(sell_price):.3f}\n"
+                f"💵 Sim. P&amp;L: {pnl_str} USDC\n"
+                f"📋 {title}"
+            )
+            return
+
+    # Live mode — sælg via CLOB
+    result = await sell_from_clob(event, shares)
+    async with acquire() as conn:
+        pnl_live = (
+            (result.price - buy_price) * (result.size_filled or Decimal("0"))
+            if result.status == "filled" and result.price
+            else None
+        )
+        won_live = bool(pnl_live > 0) if pnl_live is not None else None
+        await conn.execute(
+            """
+            UPDATE copy_orders
+               SET status         = $2,
+                   sell_price     = $3,
+                   sell_timestamp = now(),
+                   pnl_usdc       = $4,
+                   won            = $5
+             WHERE id = $1
+            """,
+            order_id,
+            "sold" if result.status == "filled" else "failed",
+            result.price or sell_price,
+            pnl_live,
+            won_live,
+        )
+
+    if result.status == "filled":
+        emoji = "📈" if won_live else "📉"
+        pnl_str = f"${float(pnl_live):+.2f}" if pnl_live is not None else "?"
+        await send_telegram(
+            f"📤 <b>LIVE EXIT</b> — {tag}\n"
+            f"{emoji} {event.outcome.upper()} solgt @ ${float(result.price or 0):.3f}\n"
+            f"💵 P&amp;L: {pnl_str} USDC\n"
+            f"📋 {title}"
+        )
+    else:
+        await send_telegram(f"❌ <b>SELL FEJL</b> — {tag}\n{result.error_msg}")
+
+
 async def process_trade_event(event: TradeEvent) -> None:
-    """Kør gates → siz ordre → eksekvér (paper eller live)."""
+    """Rout trade_event til korrekt handler baseret på event_type."""
     global _last_processed
     _last_processed = time.time()
+
+    if event.event_type == "sell_signal":
+        await _process_sell_signal(event)
+        return
 
     tag = event.wallet_label or event.wallet_address[:8]
     log.info("[%s] event id=%d condition=%s", tag, event.id, event.condition_id[:12])
