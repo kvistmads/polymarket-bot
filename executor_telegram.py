@@ -90,6 +90,7 @@ async def send_daily_summary(
     today_count: int,
     by_outcome: list[dict],
     top_market: str | None,
+    per_wallet: list[dict] | None = None,
 ) -> None:
     """Send daglig opsummering til Telegram (kaldes kl. 06:00 UTC fra executor.py)."""
     total = int(totals.get("total") or 0)
@@ -112,6 +113,27 @@ async def send_daily_summary(
         f"{pnl_emoji} <b>Sim. P&amp;L:</b> ${total_pnl:+.2f} USDC  (ROI {roi:+.1f}%)",
         f"🔢 <b>Trades i dag:</b> {today_count}  |  Total: {total}",
     ]
+
+    # ── Per-wallet opdeling ──
+    if per_wallet and len(per_wallet) > 1:
+        lines.append("")
+        lines.append("👛 <b>Per wallet:</b>")
+        for w in per_wallet:
+            w_won = int(w.get("won_count") or 0)
+            w_lost = int(w.get("lost_count") or 0)
+            w_pending = int(w.get("pending_count") or 0)
+            w_pnl = float(w.get("total_pnl") or 0)
+            w_inv = float(w.get("total_invested") or 0)
+            w_today = int(w.get("today_count") or 0)
+            w_res = w_won + w_lost
+            w_wr = w_won / w_res if w_res > 0 else 0
+            w_roi = (w_pnl / w_inv * 100) if w_inv > 0 else 0
+            w_emoji = "📈" if w_pnl >= 0 else "📉"
+            lines.append(
+                f"  <b>{w['tag']}</b>  {w_wr:.0%} WR · "
+                f"{w_emoji}${w_pnl:+.2f} (ROI {w_roi:+.1f}%) · "
+                f"{w_today} i dag"
+            )
 
     if by_outcome:
         lines.append("")
