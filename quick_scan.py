@@ -69,42 +69,39 @@ def _dune_get(path: str) -> dict:
 
 def fetch_from_dune(address: str) -> list[dict] | None:
     """
-    Kør Dune-query med wallet som parameter og returnér rækker.
+    Kør Dune-query med wallet som parameter og returnér aktivitetsrækker.
+
+    Dune giver os handelshistorik uden offset-begrænsning. Bemærk: Dunes
+    polymarket_polygon.market_trades tabel har ikke forudberegnet P&L —
+    det henter vi fra Polymarket activity API i stedet. Dune bruges til
+    aktivitetsmetrics: volumen, antal handler, hvornår wallet sidst handlede.
 
     Dune SQL-query (opret på dune.com, sæt ID i DUNE_QUERY_ID):
     ────────────────────────────────────────────────────────────
-    -- Polymarket wallet historisk performance
-    -- Parameter: wallet_address (tekst)
-    WITH trades AS (
-        SELECT
-            t.condition_id,
-            t.title,
-            t.outcome,
-            t.maker_amount_filled   AS usdc_in,
-            t.taker_amount_filled   AS shares_out,
-            t.type,                 -- 'BUY' | 'SELL' | 'REDEEM'
-            t.cash_pnl,
-            t.percent_pnl,
-            t.timestamp
-        FROM polymarket_polygon.trades t  -- eller det korrekte tabelnavn på Dune
-        WHERE LOWER(t.proxy_wallet) = LOWER('{{wallet_address}}')
-          AND t.type IN ('SELL', 'REDEEM')
-          AND t.timestamp >= NOW() - INTERVAL '90' DAY
-    )
+    -- Polymarket wallet aktivitetsoversigt
+    -- Officiel tabel: polymarket_polygon.market_trades
+    -- Dokumentation: docs.dune.com/data-catalog/curated/prediction-markets/polymarket/market_trades
+    --
+    -- Parameter: wallet_address (tekst, fx '0xabc...')
+    -- OBS: maker og taker er VARBINARY — kast til VARCHAR ved sammenligning.
+
     SELECT
-        COUNT(*)                                    AS resolved_trades,
-        SUM(CASE WHEN cash_pnl > 0 THEN 1 ELSE 0 END) AS won,
-        AVG(CASE WHEN cash_pnl > 0 THEN 1.0 ELSE 0.0 END) AS win_rate,
-        SUM(cash_pnl)                               AS total_pnl,
-        AVG(cash_pnl)                               AS avg_pnl,
-        AVG(percent_pnl)                            AS avg_pct_return,
-        MAX(cash_pnl)                               AS best_pnl,
-        MIN(cash_pnl)                               AS worst_pnl,
-        MAX(percent_pnl)                            AS best_pct,
-        MIN(percent_pnl)                            AS worst_pct
-    FROM trades
+        COUNT(*)                                                        AS total_trade_events,
+        COUNT(DISTINCT CAST(condition_id AS VARCHAR))                   AS unique_markets,
+        SUM(amount)                                                     AS total_volume_usd,
+        AVG(amount)                                                     AS avg_trade_size_usd,
+        MIN(block_time)                                                 AS first_trade,
+        MAX(block_time)                                                 AS last_trade,
+        COUNT(CASE WHEN block_time >= NOW() - INTERVAL '30' DAY THEN 1 END) AS trades_last_30d,
+        COUNT(CASE WHEN block_time >= NOW() - INTERVAL '7'  DAY THEN 1 END) AS trades_last_7d
+    FROM polymarket_polygon.market_trades
+    WHERE
+        block_time >= NOW() - INTERVAL '365' DAY
+        AND (
+            LOWER(CAST(maker AS VARCHAR)) = LOWER('{{wallet_address}}')
+            OR LOWER(CAST(taker AS VARCHAR)) = LOWER('{{wallet_address}}')
+        )
     ────────────────────────────────────────────────────────────
-    Bemærk: tabelnavn og feltnavne kan variere — tjek på dune.com/browse/tables
     """
     if not DUNE_API_KEY or not DUNE_QUERY_ID:
         return None
@@ -266,35 +263,34 @@ def score_trades(trades: list[dict]) -> dict:
     }
 
 
-def score_from_dune_rows(rows: list[dict]) -> dict | None:
-    """Byg score-dict fra Dune-aggregerede rækker (én række = ét resultat)."""
+def print_dune_activity(address: str, rows: list[dict]) -> None:
+    """Print aktivitetsmetrics fra Dune (supplerer P&L fra activity API)."""
     if not rows:
-        return None
-    r = rows[0]  # Aggregeret query → én række
-    try:
-        total = int(r.get("resolved_trades") or 0)
-        won = int(r.get("won") or 0)
-        win_rate = float(r.get("win_rate") or 0)
-        total_pnl = float(r.get("total_pnl") or 0)
-        avg_pnl = float(r.get("avg_pnl") or 0)
-        best_pct = float(r.get("best_pct") or 0)
-        worst_pct = float(r.get("worst_pct") or 0)
-        best_pnl = float(r.get("best_pnl") or 0)
-        worst_pnl = float(r.get("worst_pnl") or 0)
-    except (TypeError, ValueError):
-        return None
+        print("  Dune: ingen data returneret.")
+        return
+    r = rows[0]
+    total = int(r.get("total_trade_events") or 0)
+    markets = int(r.get("unique_markets") or 0)
+    volume = _safe_float(r.get("total_volume_usd"))
+    avg_size = _safe_float(r.get("avg_trade_size_usd"))
+    last_30d = int(r.get("trades_last_30d") or 0)
+    last_7d = int(r.get("trades_last_7d") or 0)
+    first = str(r.get("first_trade") or "?")[:10]
+    last = str(r.get("last_trade") or "?")[:10]
 
-    return {
-        "total": total,
-        "won": won,
-        "win_rate": win_rate,
-        "total_pnl": total_pnl,
-        "avg_pnl": avg_pnl,
-        "sortino": None,       # Kræver per-trade data — tilføj hvis query udvides
-        "max_drawdown": None,  # Samme
-        "best_trade": {"title": "(via Dune)", "outcome": "", "pnl": best_pnl, "pct": best_pct},
-        "worst_trade": {"title": "(via Dune)", "outcome": "", "pnl": worst_pnl, "pct": worst_pct},
-    }
+    print()
+    print("─" * 62)
+    print(f"  Wallet:          {address}")
+    print(f"  Datakilde:       Dune Analytics (fuld historik, 365 dage)")
+    print("─" * 62)
+    print(f"  On-chain events: {total}  (på {markets} markeder)")
+    print(f"  Total volumen:   ${volume:,.0f} USDC")
+    print(f"  Gns. handl.str: ${avg_size:,.2f} USDC")
+    print(f"  Seneste 30 dage: {last_30d} handlinger")
+    print(f"  Seneste 7 dage:  {last_7d} handlinger")
+    print(f"  Første handel:   {first}")
+    print(f"  Seneste handel:  {last}")
+    print("─" * 62)
 
 
 # ── Output ─────────────────────────────────────────────────────────────────────
@@ -338,22 +334,28 @@ if __name__ == "__main__":
 
     address = sys.argv[1]
 
-    # Forsøg 1: Dune Analytics
+    # ── Del 1: P&L via Polymarket activity API (cashPnl forudberegnet af Polymarket) ──
+    print(f"Henter P&L data via Polymarket activity API...")
+    trades = fetch_resolved_activity(address)
+    if trades:
+        scores = score_trades(trades)
+        print_scores(
+            address, scores,
+            f"Polymarket API — {scores['total']} afsluttede trades (seneste historik)",
+        )
+    else:
+        print("  Ingen afsluttede trades fundet via activity API.")
+
+    # ── Del 2: Aktivitetshistorik via Dune (ingen offset-begrænsning) ──────────────
     if DUNE_API_KEY and DUNE_QUERY_ID:
-        print(f"Scanner {address} via Dune Analytics...")
+        print(f"\nHenter aktivitetsdata via Dune Analytics (fuld historik)...")
         dune_rows = fetch_from_dune(address)
         if dune_rows is not None:
-            scores = score_from_dune_rows(dune_rows)
-            if scores:
-                print_scores(address, scores, "Dune Analytics (fuld historik)")
-                sys.exit(0)
-        print("  Dune fejlede — skifter til Polymarket activity API\n")
+            print_dune_activity(address, dune_rows)
+        else:
+            print("  Dune fejlede — kun activity API data tilgængeligt.")
+    else:
+        print("\n(Dune ikke konfigureret — tilføj DUNE_API_KEY + DUNE_QUERY_ID i .env for fuld historik)")
 
-    # Forsøg 2: Polymarket activity API (cashPnl-filtreret)
-    print(f"Scanner {address} via Polymarket activity API (seneste afsluttede trades)...")
-    trades = fetch_resolved_activity(address)
     if not trades:
-        print("Ingen afsluttede trades fundet — tjek wallet-adressen.")
-        sys.exit(0)
-    scores = score_trades(trades)
-    print_scores(address, scores, f"Polymarket API (seneste {scores['total']} afsluttede trades)")
+        sys.exit(1)
