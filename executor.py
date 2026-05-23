@@ -647,12 +647,33 @@ async def _build_and_send_daily_summary() -> None:
             LIMIT 1
             """
         )
+        per_wallet = await conn.fetch(
+            """
+            SELECT
+                COALESCE(w.label,
+                    LEFT(w.address, 6) || '…' || RIGHT(w.address, 4)) AS tag,
+                COUNT(*)                                         AS total,
+                COUNT(*) FILTER (WHERE co.won = true)            AS won_count,
+                COUNT(*) FILTER (WHERE co.won = false)           AS lost_count,
+                COUNT(*) FILTER (WHERE co.won IS NULL)           AS pending_count,
+                COALESCE(SUM(co.pnl_usdc), 0)                   AS total_pnl,
+                COALESCE(SUM(co.size_filled * co.price), 0)      AS total_invested,
+                COUNT(*) FILTER (
+                    WHERE co.timestamp >= CURRENT_DATE)          AS today_count
+            FROM copy_orders co
+            JOIN wallets w ON w.id = co.source_wallet_id
+            WHERE co.status IN ('paper', 'filled')
+            GROUP BY w.label, w.address
+            ORDER BY SUM(co.pnl_usdc) DESC NULLS LAST
+            """
+        )
 
     await send_daily_summary(
         totals=dict(totals),
         today_count=int(today["today_count"]) if today else 0,
         by_outcome=[dict(r) for r in by_outcome],
         top_market=str(top_market["title"]) if top_market and top_market["title"] else None,
+        per_wallet=[dict(r) for r in per_wallet],
     )
 
 
