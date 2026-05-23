@@ -148,8 +148,86 @@ async def submit_to_clob(event: TradeEvent, size: Decimal) -> OrderResult:
         )
 
 
+async def sell_from_clob(event: TradeEvent, shares: Decimal) -> OrderResult:
+    """Sælg vores copy-position på CLOB — FOK markedsordre på bid-siden.
+
+    shares = antal tokens vi holder (size_filled_usdc / buy_price).
+    Kaldt kun i live mode fra executor._process_sell_signal.
+    """
+    try:
+        token_id = await _resolve_token_id(event.condition_id, event.outcome)
+        if not token_id:
+            return OrderResult(
+                status="failed",
+                size_filled=None,
+                price=None,
+                error_msg=f"token_id ikke fundet for {event.condition_id}/{event.outcome}",
+            )
+
+        book = await get_clob_orderbook(token_id)
+        bids = book.get("bids", [])
+        if not bids:
+            return OrderResult(
+                status="failed",
+                size_filled=None,
+                price=None,
+                error_msg="ingen bids i orderbook — kan ikke sælge",
+            )
+
+        best_bid = Decimal(str(bids[0]["price"]))
+        # 0.3% slippage ved salg (sæt lidt lavere for at sikre fill)
+        order_price = max(best_bid * Decimal("0.997"), Decimal("0.01"))
+
+        return await _place_fok_sell_order(token_id, order_price, shares)
+
+    except Exception as exc:
+        log.exception("sell_from_clob fejlede (key redacted)")
+        return OrderResult(
+            status="failed",
+            size_filled=None,
+            price=None,
+            error_msg=f"{type(exc).__name__}: {exc}",
+        )
+
+
+async def _place_fok_sell_order(token_id: str, price: Decimal, shares: Decimal) -> OrderResult:
+    """Opret og send én FOK SELL limit ordre."""
+    from py_clob_client.clob_types import OrderArgs, OrderType, Side  # type: ignore[import]
+
+    loop = asyncio.get_event_loop()
+    clob = _get_clob_client()
+
+    order_args = OrderArgs(
+        token_id=token_id,
+        price=float(price),
+        size=float(shares),
+        side=Side.SELL,
+        fee_rate_bps=0,
+        nonce=0,
+        expiration=0,
+    )
+    signed = await loop.run_in_executor(None, clob.create_order, order_args)
+    resp = await loop.run_in_executor(
+        None, lambda: clob.post_order(signed, OrderType.FOK)
+    )
+
+    if isinstance(resp, dict) and resp.get("status") == "matched":
+        return OrderResult(
+            status="filled",
+            size_filled=Decimal(str(resp.get("size_matched", shares))),
+            price=Decimal(str(resp.get("price", price))),
+            error_msg=None,
+        )
+    return OrderResult(
+        status="failed",
+        size_filled=None,
+        price=None,
+        error_msg=str(resp),
+    )
+
+
 async def _place_fok_order(token_id: str, price: Decimal, size: Decimal) -> OrderResult:
-    """Opret og send én FOK limit ordre. Kaldt kun fra submit_to_clob."""
+    """Opret og send én FOK BUY limit ordre. Kaldt kun fra submit_to_clob."""
     from py_clob_client.clob_types import OrderArgs, OrderType, Side  # type: ignore[import]
 
     loop = asyncio.get_event_loop()

@@ -255,6 +255,34 @@ async def _insert_trade_event(
     )
 
 
+async def _insert_sell_signal(
+    conn: asyncpg.Connection,
+    wallet_id: int,
+    condition_id: str,
+    outcome: str,
+    size: float,
+    price: float,
+) -> None:
+    """Indsæt immutable trade_event med event_type='sell_signal'.
+
+    pg_notify-trigger (migration 006) sender automatisk NOTIFY til executor.
+    new_size = antal shares solgt, price_at_event = salgspris.
+    """
+    await conn.execute(
+        """
+        INSERT INTO trade_events (
+            wallet_id, condition_id, outcome, event_type,
+            old_size, new_size, price_at_event, pnl_at_close
+        ) VALUES ($1, $2, $3, 'sell_signal', NULL, $4, $5, NULL)
+        """,
+        wallet_id,
+        condition_id,
+        outcome,
+        Decimal(str(size)),
+        Decimal(str(price)),
+    )
+
+
 # ── activity processing ────────────────────────────────────────────────────────
 
 def _dedup_key(trade: dict) -> str:
@@ -290,13 +318,18 @@ async def process_new_trade(
     trade: dict,
 ) -> bool:
     """
-    Behandl ét nyt BUY-trade fra activity API.
+    Behandl ét nyt trade fra activity API (BUY eller SELL).
+
+    BUY  → skriver trade_event 'opened'      → executor åbner copy-position.
+    SELL → skriver trade_event 'sell_signal' → executor lukker copy-position.
 
     Returns True hvis trade_event blev skrevet til DB.
     """
     side = (trade.get("side") or "").upper()
+    if side == "SELL":
+        return await _process_sell_trade(wallet, wallet_id, trade)
     if side != "BUY":
-        return False  # Ignorer SELL/REDEEM
+        return False  # Ignorer REDEEM og ukendte typer
 
     condition_id = _extract_condition_id(trade)
     if not condition_id:
@@ -341,6 +374,41 @@ async def process_new_trade(
         return True
     except Exception:
         log.exception("DB-fejl ved behandling af trade %s", condition_id[:12])
+        return False
+
+
+async def _process_sell_trade(
+    wallet: str,
+    wallet_id: int,
+    trade: dict,
+) -> bool:
+    """
+    Behandl SELL-trade fra fulgt wallet → skriv sell_signal trade_event.
+
+    Executor finder vores åbne copy_order og lukker positionen.
+    Returns True hvis sell_signal blev skrevet til DB.
+    """
+    condition_id = _extract_condition_id(trade)
+    if not condition_id:
+        return False
+
+    outcome = trade.get("outcome", "")
+    size    = float(trade.get("size",  0) or 0)
+    price   = float(trade.get("price", 0) or 0)
+    title   = (trade.get("title") or condition_id[:12])[:55]
+
+    log.info(
+        "[%s…%s] <<< SELL SIGNAL: %s (%s) @ $%.3f",
+        wallet[:6], wallet[-4:], title, outcome, price,
+    )
+
+    try:
+        async with acquire() as conn:
+            await _insert_sell_signal(conn, wallet_id, condition_id, outcome, size, price)
+        log.info("  📤 sell_signal skrevet — executor lukker copy-position")
+        return True
+    except Exception:
+        log.exception("DB-fejl ved sell_signal %s", condition_id[:12])
         return False
 
 
