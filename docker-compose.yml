@@ -31,6 +31,8 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
       TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID}
+      DUNE_API_KEY: ${DUNE_API_KEY:-}
+      DUNE_QUERY_ID: ${DUNE_QUERY_ID:-}
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
       interval: 30s
