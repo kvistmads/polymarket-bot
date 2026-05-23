@@ -2,10 +2,11 @@
 quick_scan.py — Scan en wallet uden DB-afhængighed.
 
 Bruger to datakilder i rækkefølge:
-  1. Dune Analytics API (foretrukket) — fuld historik, ingen offset-begrænsning.
-     Kræver DUNE_API_KEY i .env eller som env-var.
-  2. Polymarket activity API (fallback) — filtrerer for cashPnl != 0 entries
-     (SELL/REDEEM), som repræsenterer faktisk afsluttede trades.
+  1. Polymarket activity API — REDEEM-entries angiver resolved positioner.
+     usdcSize > 0 = vundet, usdcSize == 0 = tabt (outcomeIndex=999).
+     cashPnl/percentPnl returneres ikke længere af API (altid null/fraværende).
+  2. Dune Analytics API (supplement) — fuld aktivitetshistorik uden offset-begrænsning.
+     Kræver DUNE_API_KEY + DUNE_QUERY_ID i .env.
 
 Brug: python quick_scan.py 0xADRESSE
 
@@ -144,13 +145,16 @@ def fetch_from_dune(address: str) -> list[dict] | None:
 
 def fetch_resolved_activity(address: str) -> list[dict]:
     """
-    Hent activity-entries med non-zero cashPnl (SELL/REDEEM-typer).
+    Hent REDEEM-entries fra Polymarket activity API.
 
-    BUY-entries har altid cashPnl=0 og filtreres fra. Kun afsluttede
-    handler tæller i win rate-beregningen.
+    Polymarket API returnerer ikke længere cashPnl/percentPnl.
+    I stedet bruges REDEEM-entries og usdcSize:
+      - usdcSize > 0  → wallet holdt vindende side (WIN)
+      - usdcSize == 0 → wallet holdt tabende side (LOSS, outcomeIndex=999)
 
-    Begrænsning: API returnerer max 3000 entries (nyeste først). Giver
-    de seneste ~150-500 afsluttede trades afhængigt af wallet-volumen.
+    SELL-trades (tidlig exit) udelades — cost basis kendes ikke fra API.
+
+    Begrænsning: API returnerer max 3000 entries (nyeste først).
     """
     all_entries: list[dict] = []
     offset = 0
@@ -186,10 +190,12 @@ def fetch_resolved_activity(address: str) -> list[dict]:
     if hit_limit:
         print(f"  (API-grænse på 3000 entries nået — viser de seneste {len(all_entries)})")
 
-    # Filtrer: kun entries med faktisk P&L = afsluttede positioner
-    resolved = [e for e in all_entries if _safe_float(e.get("cashPnl")) != 0.0]
-    print(f"  Heraf {len(resolved)} afsluttede trades (non-zero cashPnl)")
-    return resolved
+    # Filtrer: kun REDEEM-entries = resolved positioner
+    redeems = [e for e in all_entries if e.get("type") == "REDEEM"]
+    wins = sum(1 for e in redeems if _safe_float(e.get("usdcSize")) > 0)
+    losses = len(redeems) - wins
+    print(f"  Heraf {len(redeems)} resolved positioner ({wins} vandt, {losses} tabte)")
+    return redeems
 
 
 # ── Scoring ────────────────────────────────────────────────────────────────────
@@ -202,64 +208,36 @@ def _safe_float(v: Any, default: float = 0.0) -> float:
 
 
 def score_trades(trades: list[dict]) -> dict:
-    """Beregn metrics fra liste af afsluttede trade-dicts (cashPnl != 0)."""
+    """Beregn metrics fra REDEEM-entries (usdcSize > 0 = vundet)."""
     if not trades:
         return {
             "total": 0, "won": 0, "win_rate": None,
-            "total_pnl": 0.0, "avg_pnl": None,
-            "sortino": None, "max_drawdown": None,
-            "best_trade": None, "worst_trade": None,
+            "total_redeemed": 0.0, "avg_win_size": None,
+            "best_trade": None,
         }
 
-    pnls = [_safe_float(t.get("cashPnl")) for t in trades]
-    pct_returns = [_safe_float(t.get("percentPnl")) / 100.0 for t in trades]
-
-    won = sum(1 for p in pnls if p > 0)
+    won_entries = [t for t in trades if _safe_float(t.get("usdcSize")) > 0]
+    won = len(won_entries)
     win_rate = won / len(trades)
-    total_pnl = sum(pnls)
-    avg_pnl = total_pnl / len(trades)
-
-    # Sortino
-    sortino: float | None = None
-    if len(pct_returns) >= 2:
-        downside = [r for r in pct_returns if r < 0]
-        if not downside:
-            sortino = 99.0
-        else:
-            ds_std = statistics.stdev(downside) if len(downside) > 1 else abs(downside[0])
-            if ds_std > 0:
-                sortino = (statistics.mean(pct_returns) * 52) / (ds_std * math.sqrt(52))
-
-    # Max drawdown
-    cum = list(itertools.accumulate(pnls))
-    peak = cum[0]
-    max_dd = 0.0
-    for val in cum:
-        peak = max(peak, val)
-        if peak > 0:
-            max_dd = max(max_dd, (peak - val) / peak)
+    total_redeemed = sum(_safe_float(t.get("usdcSize")) for t in won_entries)
+    avg_win_size = total_redeemed / won if won > 0 else None
 
     def _fmt(t: dict) -> dict:
         return {
             "title": str(t.get("title") or t.get("conditionId", "?"))[:55],
-            "outcome": str(t.get("outcome") or "?"),
-            "pnl": _safe_float(t.get("cashPnl")),
-            "pct": _safe_float(t.get("percentPnl")),
+            "outcome": str(t.get("outcome") or "vindende side"),
+            "usdcSize": _safe_float(t.get("usdcSize")),
         }
 
-    best = max(trades, key=lambda t: _safe_float(t.get("cashPnl")))
-    worst = min(trades, key=lambda t: _safe_float(t.get("cashPnl")))
+    best = max(won_entries, key=lambda t: _safe_float(t.get("usdcSize"))) if won_entries else None
 
     return {
         "total": len(trades),
         "won": won,
         "win_rate": win_rate,
-        "total_pnl": total_pnl,
-        "avg_pnl": avg_pnl,
-        "sortino": sortino,
-        "max_drawdown": max_dd,
-        "best_trade": _fmt(best),
-        "worst_trade": _fmt(worst),
+        "total_redeemed": total_redeemed,
+        "avg_win_size": avg_win_size,
+        "best_trade": _fmt(best) if best else None,
     }
 
 
@@ -297,31 +275,22 @@ def print_dune_activity(address: str, rows: list[dict]) -> None:
 
 def print_scores(address: str, s: dict, source: str) -> None:
     wr = s["win_rate"]
-    so = s["sortino"]
-    dd = s["max_drawdown"]
-    ap = s["avg_pnl"]
+    aw = s["avg_win_size"]
 
     print()
     print("─" * 62)
     print(f"  Wallet:          {address}")
     print(f"  Datakilde:       {source}")
     print("─" * 62)
-    print(f"  Afsluttede:      {s['total']}  (heraf {s['won']} vandt)")
+    print(f"  Resolved bets:   {s['total']}  (heraf {s['won']} vandt)")
     print(f"  Win rate:        {f'{wr*100:.1f}%' if wr is not None else 'N/A'}")
-    print(f"  Total P&L:       ${s['total_pnl']:+,.2f} USDC")
-    print(f"  Avg P&L/trade:   {f'${ap:+,.2f}' if ap is not None else 'N/A'}")
-    print(f"  Sortino ratio:   {f'{so:.2f}' if so is not None else 'N/A'}")
-    print(f"  Max drawdown:    {f'{dd*100:.1f}%' if dd is not None else 'N/A'}")
+    print(f"  Total redeemed:  ${s['total_redeemed']:,.2f} USDC")
+    print(f"  Gns. vindende:   {f'${aw:,.2f} USDC' if aw is not None else 'N/A'}")
+    print(f"  Note: P&L (netto) kan ikke beregnes — cashPnl fjernet fra API")
     if s.get("best_trade"):
         b = s["best_trade"]
-        label = f"{b['title']} [{b['outcome']}]" if b['outcome'] else b['title']
-        print(f"  Bedste trade:    {label}")
-        print(f"                   +${b['pnl']:,.0f} USDC  ({b['pct']:+.1f}%)")
-    if s.get("worst_trade"):
-        w = s["worst_trade"]
-        label = f"{w['title']} [{w['outcome']}]" if w['outcome'] else w['title']
-        print(f"  Værste trade:    {label}")
-        print(f"                   ${w['pnl']:,.0f} USDC  ({w['pct']:+.1f}%)")
+        print(f"  Bedste REDEEM:   {b['title']} [{b['outcome']}]")
+        print(f"                   ${b['usdcSize']:,.0f} USDC redeemed")
     print("─" * 62)
 
 
