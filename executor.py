@@ -708,48 +708,48 @@ async def daily_summary_loop() -> None:
 
 
 async def _build_and_send_daily_summary() -> None:
-    """Hent stats fra DB og send via Telegram."""
+    """Hent stats fra DB og send via Telegram.
+
+    Alle queries filtrerer til KUN aktuelt fulgte wallets
+    (followed_wallets WHERE unfollowed_at IS NULL).
+    """
     async with acquire() as conn:
         totals = await conn.fetchrow(
             """
             SELECT
-                COUNT(*)                                      AS total,
-                COUNT(*) FILTER (WHERE won = true)            AS won_count,
-                COUNT(*) FILTER (WHERE won = false)           AS lost_count,
-                COUNT(*) FILTER (WHERE won IS NULL)           AS pending_count,
-                COALESCE(SUM(pnl_usdc), 0)                   AS total_pnl,
-                COALESCE(SUM(size_filled * price), 0)         AS total_invested
-            FROM copy_orders
-            WHERE status IN ('paper', 'filled')
+                COUNT(*)                                       AS total,
+                COUNT(*) FILTER (WHERE co.won = true)          AS won_count,
+                COUNT(*) FILTER (WHERE co.won = false)         AS lost_count,
+                COUNT(*) FILTER (WHERE co.won IS NULL)         AS pending_count,
+                COALESCE(SUM(co.pnl_usdc), 0)                 AS total_pnl,
+                COALESCE(SUM(co.size_filled * co.price), 0)   AS total_invested
+            FROM copy_orders co
+            JOIN wallets w          ON w.id = co.source_wallet_id
+            JOIN followed_wallets fw ON fw.wallet_id = w.id
+            WHERE co.status IN ('paper', 'filled')
+              AND fw.unfollowed_at IS NULL
             """
         )
         today = await conn.fetchrow(
             """
             SELECT COUNT(*) AS today_count
-            FROM copy_orders
-            WHERE status IN ('paper', 'filled')
-              AND timestamp >= CURRENT_DATE
-            """
-        )
-        by_outcome = await conn.fetch(
-            """
-            SELECT
-                UPPER(outcome)                                AS outcome,
-                COUNT(*)                                      AS total,
-                COUNT(*) FILTER (WHERE won = true)            AS won_count
-            FROM copy_orders
-            WHERE won IS NOT NULL
-            GROUP BY UPPER(outcome)
-            ORDER BY total DESC
-            LIMIT 6
+            FROM copy_orders co
+            JOIN wallets w          ON w.id = co.source_wallet_id
+            JOIN followed_wallets fw ON fw.wallet_id = w.id
+            WHERE co.status IN ('paper', 'filled')
+              AND co.timestamp >= CURRENT_DATE
+              AND fw.unfollowed_at IS NULL
             """
         )
         top_market = await conn.fetchrow(
             """
             SELECT mm.title, COUNT(co.*) AS cnt
             FROM copy_orders co
-            JOIN market_metadata mm ON mm.condition_id = co.condition_id
+            JOIN market_metadata mm  ON mm.condition_id = co.condition_id
+            JOIN wallets w           ON w.id = co.source_wallet_id
+            JOIN followed_wallets fw ON fw.wallet_id = w.id
             WHERE co.timestamp >= CURRENT_DATE - INTERVAL '7 days'
+              AND fw.unfollowed_at IS NULL
             GROUP BY mm.title
             ORDER BY cnt DESC
             LIMIT 1
@@ -769,8 +769,10 @@ async def _build_and_send_daily_summary() -> None:
                 COUNT(*) FILTER (
                     WHERE co.timestamp >= CURRENT_DATE)          AS today_count
             FROM copy_orders co
-            JOIN wallets w ON w.id = co.source_wallet_id
+            JOIN wallets w          ON w.id = co.source_wallet_id
+            JOIN followed_wallets fw ON fw.wallet_id = w.id
             WHERE co.status IN ('paper', 'filled')
+              AND fw.unfollowed_at IS NULL
             GROUP BY w.label, w.address
             ORDER BY SUM(co.pnl_usdc) DESC NULLS LAST
             """
@@ -779,7 +781,6 @@ async def _build_and_send_daily_summary() -> None:
     await send_daily_summary(
         totals=dict(totals),
         today_count=int(today["today_count"]) if today else 0,
-        by_outcome=[dict(r) for r in by_outcome],
         top_market=str(top_market["title"]) if top_market and top_market["title"] else None,
         per_wallet=[dict(r) for r in per_wallet],
     )
