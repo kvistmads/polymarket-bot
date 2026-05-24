@@ -4,7 +4,7 @@ executor_telegram.py — Telegram Bot integration for executor.
 Eksponerer:
   send_telegram(text)                     → None
   send_approval_request(win_rate, total)  → None
-  send_daily_summary(totals, today_count, by_outcome, top_market) → None
+  send_daily_summary(totals, today_count, top_market, per_wallet) → None
   telegram_polling_loop()                 → coroutine (kør som task)
   check_go_live_gate(conn)                → None
 
@@ -88,11 +88,13 @@ async def send_approval_request(win_rate: float, total: int) -> None:
 async def send_daily_summary(
     totals: dict,
     today_count: int,
-    by_outcome: list[dict],
     top_market: str | None,
     per_wallet: list[dict] | None = None,
 ) -> None:
-    """Send daglig opsummering til Telegram (kaldes kl. 06:00 UTC fra executor.py)."""
+    """Send daglig opsummering til Telegram (kaldes kl. 06:00 UTC fra executor.py).
+
+    Viser kun tal for aktuelt fulgte wallets (filtreret i executor.py).
+    """
     total = int(totals.get("total") or 0)
     won = int(totals.get("won_count") or 0)
     lost = int(totals.get("lost_count") or 0)
@@ -114,14 +116,13 @@ async def send_daily_summary(
         f"🔢 <b>Trades i dag:</b> {today_count}  |  Total: {total}",
     ]
 
-    # ── Per-wallet opdeling ──
-    if per_wallet and len(per_wallet) > 1:
+    # ── Per-wallet opdeling (vises altid når der er data) ──
+    if per_wallet:
         lines.append("")
         lines.append("👛 <b>Per wallet:</b>")
         for w in per_wallet:
             w_won = int(w.get("won_count") or 0)
             w_lost = int(w.get("lost_count") or 0)
-            w_pending = int(w.get("pending_count") or 0)
             w_pnl = float(w.get("total_pnl") or 0)
             w_inv = float(w.get("total_invested") or 0)
             w_today = int(w.get("today_count") or 0)
@@ -134,16 +135,6 @@ async def send_daily_summary(
                 f"{w_emoji}${w_pnl:+.2f} (ROI {w_roi:+.1f}%) · "
                 f"{w_today} i dag"
             )
-
-    if by_outcome:
-        lines.append("")
-        lines.append("🎯 <b>Win rate per outcome-type:</b>")
-        for row in by_outcome:
-            ot = int(row.get("total") or 0)
-            ow = int(row.get("won_count") or 0)
-            wr = ow / ot if ot > 0 else 0
-            bar = "█" * round(wr * 10) + "░" * (10 - round(wr * 10))
-            lines.append(f"  {row['outcome']:6s} {bar} {wr:.0%}  ({ow}/{ot})")
 
     if top_market:
         lines.append("")
