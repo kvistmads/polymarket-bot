@@ -129,20 +129,74 @@ async def _fetch_trade_event(event_id: int) -> TradeEvent | None:
     )
 
 
+async def _replay_missed_events() -> None:
+    """Behandl trade_events fra de seneste 24t der ikke har en tilsvarende copy_order.
+
+    Køres ved startup for at indhente events der ankom mens executor var nede.
+    BUY-events: sikre mod dobbelt-behandling via ON CONFLICT (trade_event_id) DO NOTHING.
+    SELL-events: _process_sell_signal tjekker selv om copy_order eksisterer.
+    """
+    async with acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT te.id
+            FROM trade_events te
+            LEFT JOIN copy_orders co ON co.trade_event_id = te.id
+            WHERE te.timestamp >= NOW() - INTERVAL '24 hours'
+              AND te.event_type IN ('opened', 'sell_signal')
+              AND co.id IS NULL
+            ORDER BY te.id ASC
+            """
+        )
+
+    if not rows:
+        log.info("Startup-replay: ingen mistede events de seneste 24t")
+        return
+
+    log.info("Startup-replay: behandler %d mistede trade_events…", len(rows))
+    for row in rows:
+        try:
+            event = await _fetch_trade_event(row["id"])
+            if event:
+                await process_trade_event(event)
+        except Exception:
+            log.exception("Startup-replay fejlede for event id=%d", row["id"])
+
+
 async def listen_loop() -> None:
-    """Dedikeret LISTEN-forbindelse — LISTEN kræver dedicated connection (ikke pool)."""
-    conn = await asyncpg.connect(dsn=DB_DSN)
-    await conn.add_listener("new_trade", on_notify)
-    log.info("Lytter på pg_notify('new_trade')…")
-    try:
-        while True:
-            await asyncio.sleep(1)
-    except asyncio.CancelledError:
-        pass
-    finally:
-        await conn.remove_listener("new_trade", on_notify)
-        await conn.close()
-        log.info("LISTEN-forbindelse lukket")
+    """Dedikeret LISTEN-forbindelse med automatisk genopkobling.
+
+    Forbindelsen kan falde stille ud (netværkshiccup, DB-idle-timeout) uden
+    at kaste en exception. Keepalive-ping hvert 30s opdager dette hurtigt.
+    Ved brud genforbindes inden for 10 sekunder.
+    """
+    while True:
+        conn: asyncpg.Connection | None = None
+        try:
+            conn = await asyncpg.connect(dsn=DB_DSN)
+            await conn.add_listener("new_trade", on_notify)
+            log.info("Lytter på pg_notify('new_trade')…")
+            # Keepalive: ping DB hvert 30s for at opdage stille forbindelsesbrud
+            while True:
+                await asyncio.sleep(30)
+                await conn.execute("SELECT 1")  # kaster exception hvis forbindelsen er død
+        except asyncio.CancelledError:
+            if conn and not conn.is_closed():
+                try:
+                    await conn.remove_listener("new_trade", on_notify)
+                    await conn.close()
+                except Exception:
+                    pass
+            log.info("LISTEN-forbindelse lukket")
+            return
+        except Exception:
+            log.exception("LISTEN-forbindelse tabt — genforbinder om 10s")
+            if conn and not conn.is_closed():
+                try:
+                    await conn.close()
+                except Exception:
+                    pass
+            await asyncio.sleep(10)
 
 
 # ── Trade processing ────────────────────────────────────────────────────────────
@@ -797,6 +851,9 @@ async def main() -> None:
 
     await get_pool()
     health_runner = await _start_health_server()
+
+    # Replay mistede events fra de seneste 24t (executor var nede)
+    await _replay_missed_events()
 
     # Registrér Telegram-kommandoer
     register_command("/portfolio", _portfolio_command_handler)
