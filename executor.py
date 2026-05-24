@@ -130,11 +130,14 @@ async def _fetch_trade_event(event_id: int) -> TradeEvent | None:
 
 
 async def _replay_missed_events() -> None:
-    """Behandl trade_events fra de seneste 24t der ikke har en tilsvarende copy_order.
+    """Behandl trade_events fra de seneste 5 minutter der ikke har en tilsvarende copy_order.
 
-    Køres ved startup for at indhente events der ankom mens executor var nede.
-    BUY-events: sikre mod dobbelt-behandling via ON CONFLICT (trade_event_id) DO NOTHING.
-    SELL-events: _process_sell_signal tjekker selv om copy_order eksisterer.
+    Køres ved startup for at indhente events der ankom under en hurtig genstart
+    (f.eks. Docker-crash → auto-restart). Vinduet er bevidst kort (5 min):
+    ældre events kopieres IKKE — prisen kan have ændret sig markant og et sent
+    entry giver dårligere odds end den fulgte wallet fik.
+
+    Idempotent: ON CONFLICT (trade_event_id) DO NOTHING forhindrer dobbelt-behandling.
     """
     async with acquire() as conn:
         rows = await conn.fetch(
@@ -142,7 +145,7 @@ async def _replay_missed_events() -> None:
             SELECT te.id
             FROM trade_events te
             LEFT JOIN copy_orders co ON co.trade_event_id = te.id
-            WHERE te.timestamp >= NOW() - INTERVAL '24 hours'
+            WHERE te.timestamp >= NOW() - INTERVAL '5 minutes'
               AND te.event_type IN ('opened', 'sell_signal')
               AND co.id IS NULL
             ORDER BY te.id ASC
