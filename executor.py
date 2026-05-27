@@ -153,10 +153,10 @@ async def _replay_missed_events() -> None:
         )
 
     if not rows:
-        log.info("Startup-replay: ingen mistede events de seneste 24t")
+        log.info("Startup-replay: ingen mistede events de seneste 5 min")
         return
 
-    log.info("Startup-replay: behandler %d mistede trade_events…", len(rows))
+    log.info("Startup-replay: behandler %d mistede trade_events (seneste 5 min)…", len(rows))
     for row in rows:
         try:
             event = await _fetch_trade_event(row["id"])
