@@ -48,6 +48,7 @@ DEFAULT_WALLETS = (
 )
 
 DB_WALLET_REFRESH_INTERVAL = 300  # sekunder mellem DB-wallet-refreshes
+SIGNAL_COOLDOWN_SECONDS    = 300  # maks ét BUY-signal per wallet+marked+outcome per 5 min
 
 ACTIVITY_POLL_INTERVAL = 7   # sekunder mellem activity API-kald
 ACTIVITY_SEED_LIMIT    = 50  # antal trades der seedes ved startup
@@ -339,6 +340,19 @@ async def process_new_trade(
         return False
 
     outcome  = trade.get("outcome", "")
+
+    # ── Cooldown: maks ét BUY-signal per wallet+marked+outcome per 5 min ──
+    cooldown_key = f"{wallet}:{condition_id}:{outcome}"
+    now = time.time()
+    last = _signal_cooldown.get(cooldown_key, 0.0)
+    if now - last < SIGNAL_COOLDOWN_SECONDS:
+        log.debug(
+            "[%s…%s] Duplikat-signal ignoreret (cooldown %.0fs tilbage): %s",
+            wallet[:6], wallet[-4:], SIGNAL_COOLDOWN_SECONDS - (now - last), condition_id[:12],
+        )
+        return False
+    _signal_cooldown[cooldown_key] = now
+
     size     = float(trade.get("size",     0) or 0)
     price    = float(trade.get("price",    0) or 0)
     usdc     = float(trade.get("usdcSize", 0) or 0)
@@ -485,6 +499,7 @@ async def _refresh_active_wallets(
 
 # ── health server ──────────────────────────────────────────────────────────────
 _last_successful_poll: float = 0.0
+_signal_cooldown: dict[str, float] = {}  # "wallet:condition_id:outcome" → last_processed_time
 
 
 async def _start_health_server() -> web.AppRunner:
