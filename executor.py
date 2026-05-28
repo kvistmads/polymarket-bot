@@ -40,6 +40,7 @@ from executor_telegram import (
     check_go_live_gate,
     inject_dry_run_state,
     register_command,
+    send_approval_request,
     send_daily_summary,
     send_telegram,
     telegram_polling_loop,
@@ -427,9 +428,14 @@ async def process_trade_event(event: TradeEvent) -> None:
                 error_msg=None,
             )
             await log_copy_order(conn, event, size, result)
-            await send_telegram(_format_trade_msg("📄 PAPER", tag, event.outcome, event.price_at_event, size, title))
-            await check_go_live_gate(conn)
-            return
+            go_live_ready = await check_go_live_gate(conn)
+
+    # send_telegram uden for connection-blokken — frigiver DB-forbindelsen først
+    if _dry_run_state["active"]:
+        await send_telegram(_format_trade_msg("📄 PAPER", tag, event.outcome, event.price_at_event, size, title))
+        if go_live_ready:
+            await send_approval_request(go_live_ready[0], go_live_ready[1])
+        return
 
     # Live mode — CLOB-kald uden for connection context for at undgå timeout
     result = await submit_to_clob(event, size)
@@ -463,7 +469,7 @@ async def log_copy_order(
             (source_wallet_id, trade_event_id, condition_id, outcome, side,
              size_requested, size_filled, price, status, error_msg)
         VALUES ($1, $2, $3, $4, 'buy', $5, $6, $7, $8, $9)
-        ON CONFLICT (trade_event_id) DO NOTHING
+        ON CONFLICT (trade_event_id) WHERE trade_event_id IS NOT NULL DO NOTHING
         """,
         event.wallet_id,
         event.id,
