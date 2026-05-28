@@ -47,6 +47,8 @@ DEFAULT_WALLETS = (
     else ["0x0b7a6030507efe5db145fbb57a25ba0c5f9d86cf"]
 )
 
+DB_WALLET_REFRESH_INTERVAL = 300  # sekunder mellem DB-wallet-refreshes
+
 ACTIVITY_POLL_INTERVAL = 7   # sekunder mellem activity API-kald
 ACTIVITY_SEED_LIMIT    = 50  # antal trades der seedes ved startup
 ACTIVITY_FETCH_LIMIT   = 20  # antal trades der hentes per poll
@@ -412,6 +414,75 @@ async def _process_sell_trade(
         return False
 
 
+# ── dynamic wallet refresh ─────────────────────────────────────────────────────
+
+
+async def _load_wallets_from_db() -> list[str]:
+    """Hent aktive wallet-adresser fra followed_wallets tabellen i DB."""
+    try:
+        async with acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT w.address
+                FROM followed_wallets fw
+                JOIN wallets w ON w.id = fw.wallet_id
+                WHERE fw.unfollowed_at IS NULL
+                ORDER BY fw.followed_at ASC
+                """
+            )
+            return [r["address"] for r in rows]
+    except Exception:
+        log.exception("Kunne ikke hente wallets fra DB")
+        return []
+
+
+async def _refresh_active_wallets(
+    wallets: list[str],
+    wallet_seen: dict[str, set[str]],
+    wallet_ids: dict[str, int],
+) -> None:
+    """Synkroniser wallet-listen med followed_wallets i DB.
+
+    Nye wallets: seed seen-sæt + hent wallet_id + tilføj til poll-liste.
+    Fjernede wallets: fjern fra poll-liste + ryd state.
+    """
+    db_wallets = await _load_wallets_from_db()
+    if not db_wallets:
+        return  # DB utilgængelig — behold eksisterende liste
+
+    db_set = set(db_wallets)
+    current_set = set(wallets)
+
+    # Tilføj nye wallets
+    for wallet in db_wallets:
+        if wallet not in current_set:
+            log.info("Wallet tilføjet til polling: %s…%s", wallet[:6], wallet[-4:])
+            wallets.append(wallet)
+            # Seed seen-sæt så vi ikke notificerer om gamle trades
+            initial = await fetch_activity_async(wallet, limit=ACTIVITY_SEED_LIMIT)
+            seen: set[str] = set()
+            for t in initial:
+                tx = t.get("transactionHash", "")
+                if tx:
+                    seen.add(tx)
+            wallet_seen[wallet] = seen
+            log.info("  Seeded %d transaktioner for %s…%s", len(seen), wallet[:6], wallet[-4:])
+            # Hent / opret wallet_id i DB
+            try:
+                async with acquire() as conn:
+                    wallet_ids[wallet] = await _get_or_create_wallet_id(conn, wallet)
+            except Exception:
+                log.exception("Kunne ikke hente wallet_id for %s", wallet[:10])
+
+    # Fjern unfollowed wallets
+    for wallet in list(wallets):
+        if wallet not in db_set:
+            log.info("Wallet fjernet fra polling: %s…%s", wallet[:6], wallet[-4:])
+            wallets.remove(wallet)
+            wallet_seen.pop(wallet, None)
+            wallet_ids.pop(wallet, None)
+
+
 # ── health server ──────────────────────────────────────────────────────────────
 _last_successful_poll: float = 0.0
 
@@ -441,6 +512,15 @@ async def _start_health_server() -> web.AppRunner:
 
 async def main(wallets: list[str]) -> int:
     global _last_successful_poll
+
+    # ── Indlæs wallets fra DB (tilsidesætter env-listen hvis DB er tilgængelig) ──
+    if DB_URL:
+        db_wallets = await _load_wallets_from_db()
+        if db_wallets:
+            wallets = db_wallets
+            log.info("Wallets indlæst fra DB: %d wallets", len(wallets))
+        else:
+            log.warning("Ingen wallets i DB — falder tilbage til FOLLOWED_WALLETS fra .env")
 
     log.info("=" * 60)
     log.info("POLYMARKET MONITOR — activity API edition")
@@ -488,6 +568,7 @@ async def main(wallets: list[str]) -> int:
                  wallet[:6], wallet[-4:], len(seen))
 
     _last_successful_poll = time.time()
+    _last_wallet_refresh = time.time()
 
     # ── poll loop ──
     log.info("Starter activity polling hvert %ds...", ACTIVITY_POLL_INTERVAL)
@@ -495,7 +576,12 @@ async def main(wallets: list[str]) -> int:
         while True:
             await asyncio.sleep(ACTIVITY_POLL_INTERVAL)
 
-            for wallet in wallets:
+            # Refresh wallet-listen fra DB hvert 5. minut
+            if DB_URL and time.time() - _last_wallet_refresh >= DB_WALLET_REFRESH_INTERVAL:
+                await _refresh_active_wallets(wallets, wallet_seen, wallet_ids)
+                _last_wallet_refresh = time.time()
+
+            for wallet in list(wallets):  # list() snapshot — refresh kan ændre listen
                 try:
                     trades = await fetch_activity_async(wallet, limit=ACTIVITY_FETCH_LIMIT)
                     if not trades:

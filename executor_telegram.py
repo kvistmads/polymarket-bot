@@ -203,26 +203,29 @@ async def telegram_polling_loop() -> None:
             await asyncio.sleep(10)
 
 
-async def check_go_live_gate(conn: asyncpg.Connection) -> None:
-    """Send Telegram-godkendelse hvis win_rate > 52% over >= 20 paper trades."""
-    count_row = await conn.fetchrow(
-        "SELECT COUNT(*) AS total FROM copy_orders WHERE status = 'paper'"
+async def check_go_live_gate(conn: asyncpg.Connection) -> tuple[float, int] | None:
+    """Returnerer (win_rate, total) hvis >= 20 resolvede paper trades og win_rate >= 60%.
+
+    Bruger copy_orders.won (sat af win_rate_tracker) — kræver IKKE JOIN på trade_events.
+    Returnerer None hvis betingelserne ikke er opfyldt.
+    Kalderen (process_trade_event) sender Telegram-godkendelse baseret på returværdien.
+    """
+    row = await conn.fetchrow(
+        """
+        SELECT
+            COUNT(*)                            AS total,
+            COUNT(*) FILTER (WHERE won = true)  AS won
+        FROM copy_orders
+        WHERE status = 'paper'
+          AND won IS NOT NULL
+        """
     )
-    total = count_row["total"] if count_row else 0
+    if not row or not row["total"]:
+        return None
+    total = int(row["total"])
     if total < 20:
-        return
-
-    win_row = await conn.fetchrow("""
-        SELECT COUNT(*) AS total,
-               COUNT(*) FILTER (WHERE te.pnl_at_close > 0) AS won
-        FROM copy_orders co
-        JOIN trade_events te
-          ON te.condition_id = co.condition_id AND te.event_type = 'closed'
-        WHERE co.status = 'paper'
-        """)
-    if not win_row or not win_row["total"]:
-        return
-
-    win_rate = win_row["won"] / win_row["total"]
-    if win_rate > 0.52:
-        await send_approval_request(win_rate, int(win_row["total"]))
+        return None
+    win_rate = int(row["won"]) / total
+    if win_rate >= 0.60:
+        return (win_rate, total)
+    return None
