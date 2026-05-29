@@ -468,7 +468,14 @@ async def log_copy_order(
         INSERT INTO copy_orders
             (source_wallet_id, trade_event_id, condition_id, outcome, side,
              size_requested, size_filled, price, status, error_msg)
-        VALUES ($1, $2, $3, $4, 'buy', $5, $6, $7, $8, $9)
+        SELECT $1, $2, $3, $4, 'buy', $5, $6, $7, $8, $9
+        WHERE NOT EXISTS (
+            SELECT 1 FROM copy_orders
+            WHERE source_wallet_id = $1
+              AND condition_id = $3
+              AND outcome = $4
+              AND status IN ('paper', 'filled')
+        )
         ON CONFLICT (trade_event_id) WHERE trade_event_id IS NOT NULL DO NOTHING
         """,
         event.wallet_id,
