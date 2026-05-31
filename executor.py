@@ -605,9 +605,11 @@ async def _update_resolved_orders() -> None:
                         WHERE condition_id = $1
                           AND won IS NULL
                           AND status IN ('paper', 'filled')
-                        RETURNING won, pnl_usdc, size_filled, price
+                        RETURNING won, pnl_usdc, size_filled, price, source_wallet_id
                     )
-                    SELECT * FROM upd
+                    SELECT upd.*, COALESCE(w.label, LEFT(w.address,6)||'…'||RIGHT(w.address,4)) AS wallet_tag
+                    FROM upd
+                    JOIN wallets w ON w.id = upd.source_wallet_id
                     """,
                     condition_id,
                     winning_outcome,
@@ -624,6 +626,8 @@ async def _update_resolved_orders() -> None:
                 roi = (total_pnl / total_invested * 100) if total_invested > 0 else 0
                 emoji = "✅" if did_win else "❌"
                 result = "VANDT" if did_win else "TABTE"
+                # Saml wallet-navne (typisk kun 1, men kan være flere)
+                wallet_tags = ", ".join(dict.fromkeys(r["wallet_tag"] for r in rows_updated))
                 log.info(
                     "Resolved %s → vinder: %s  (%d orders, P&L: %+.2f)",
                     condition_id[:12],
@@ -632,7 +636,7 @@ async def _update_resolved_orders() -> None:
                     total_pnl,
                 )
                 await send_telegram(
-                    f"{emoji} <b>{result}:</b> {title}\n"
+                    f"{emoji} <b>{result} · {wallet_tags}:</b> {title}\n"
                     f"Udfald: {winning_outcome.upper()}\n"
                     f"Sim. P&amp;L: ${total_pnl:+.2f} USDC  (ROI {roi:+.1f}%)"
                 )
@@ -792,7 +796,7 @@ async def _build_and_send_daily_summary() -> None:
                 COUNT(*) FILTER (WHERE co.won = false)         AS lost_count,
                 COUNT(*) FILTER (WHERE co.won IS NULL)         AS pending_count,
                 COALESCE(SUM(co.pnl_usdc), 0)                 AS total_pnl,
-                COALESCE(SUM(co.size_filled * co.price), 0)   AS total_invested
+                COALESCE(SUM(co.size_filled), 0)              AS total_invested
             FROM copy_orders co
             JOIN wallets w          ON w.id = co.source_wallet_id
             JOIN followed_wallets fw ON fw.wallet_id = w.id
@@ -807,7 +811,7 @@ async def _build_and_send_daily_summary() -> None:
             JOIN wallets w          ON w.id = co.source_wallet_id
             JOIN followed_wallets fw ON fw.wallet_id = w.id
             WHERE co.status IN ('paper', 'filled')
-              AND co.timestamp >= CURRENT_DATE
+              AND co.timestamp >= NOW() - INTERVAL '24 hours'
               AND fw.unfollowed_at IS NULL
             """
         )
@@ -835,9 +839,9 @@ async def _build_and_send_daily_summary() -> None:
                 COUNT(*) FILTER (WHERE co.won = false)           AS lost_count,
                 COUNT(*) FILTER (WHERE co.won IS NULL)           AS pending_count,
                 COALESCE(SUM(co.pnl_usdc), 0)                   AS total_pnl,
-                COALESCE(SUM(co.size_filled * co.price), 0)      AS total_invested,
+                COALESCE(SUM(co.size_filled), 0)                 AS total_invested,
                 COUNT(*) FILTER (
-                    WHERE co.timestamp >= CURRENT_DATE)          AS today_count
+                    WHERE co.timestamp >= NOW() - INTERVAL '24 hours') AS today_count
             FROM copy_orders co
             JOIN wallets w          ON w.id = co.source_wallet_id
             JOIN followed_wallets fw ON fw.wallet_id = w.id
