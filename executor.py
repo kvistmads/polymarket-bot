@@ -304,7 +304,17 @@ async def _process_sell_signal(event: TradeEvent) -> None:
     tag = event.wallet_label or event.wallet_address[:8]
     log.info("[%s] SELL SIGNAL condition=%s outcome=%s", tag, event.condition_id[:12], event.outcome)
 
+    wallet_mode = "paper"  # sættes korrekt i første conn-blok nedenfor
+
     async with acquire() as conn:
+        # Hent wallet-mode (DRY_RUN overstyrer til paper uanset wallet-indstilling)
+        fw_row = await conn.fetchrow(
+            "SELECT mode FROM followed_wallets WHERE wallet_id = $1 AND unfollowed_at IS NULL",
+            event.wallet_id,
+        )
+        wallet_mode = fw_row["mode"] if fw_row else "paper"
+        effective_mode = "paper" if _dry_run_state["active"] else wallet_mode
+
         row = await conn.fetchrow(
             """
             SELECT id, size_filled, price
@@ -337,7 +347,7 @@ async def _process_sell_signal(event: TradeEvent) -> None:
 
         title = await _get_market_title(conn, event.condition_id)
 
-        if _dry_run_state["active"]:
+        if effective_mode == "paper":
             await conn.execute(
                 """
                 UPDATE copy_orders
@@ -356,7 +366,8 @@ async def _process_sell_signal(event: TradeEvent) -> None:
                 f"📤 <b>PAPER EXIT</b> — {tag}\n"
                 f"{emoji} {event.outcome.upper()} solgt @ ${float(sell_price):.3f}\n"
                 f"💵 Sim. P&amp;L: {pnl_str} USDC\n"
-                f"📋 {title}"
+                f"📋 {title}",
+                mode=wallet_mode,
             )
             return
 
@@ -393,10 +404,11 @@ async def _process_sell_signal(event: TradeEvent) -> None:
             f"📤 <b>LIVE EXIT</b> — {tag}\n"
             f"{emoji} {event.outcome.upper()} solgt @ ${float(result.price or 0):.3f}\n"
             f"💵 P&amp;L: {pnl_str} USDC\n"
-            f"📋 {title}"
+            f"📋 {title}",
+            mode=wallet_mode,
         )
     else:
-        await send_telegram(f"❌ <b>SELL FEJL</b> — {tag}\n{result.error_msg}")
+        await send_telegram(f"❌ <b>SELL FEJL</b> — {tag}\n{result.error_msg}", mode=wallet_mode)
 
 
 async def process_trade_event(event: TradeEvent) -> None:
@@ -411,42 +423,63 @@ async def process_trade_event(event: TradeEvent) -> None:
     tag = event.wallet_label or event.wallet_address[:8]
     log.info("[%s] event id=%d condition=%s", tag, event.id, event.condition_id[:12])
 
+    # Initialisér lokale variable — overskrives inde i conn-blokken
+    wallet_mode    = "paper"
+    effective_mode = "paper"
+    go_live_ready: list[dict] = []
+    size           = None
+    title          = ""
+
     async with acquire() as conn:
         ok, reason = await passes_gates(conn, event)
         if not ok:
             log.info("[%s] Gate afviste event %d: %s", tag, event.id, reason)
             return
 
-        size = await calculate_size(conn, event.wallet_id, event)
+        # Hent wallet-mode (DRY_RUN overstyrer til paper uanset wallet-indstilling)
+        fw_row = await conn.fetchrow(
+            "SELECT mode FROM followed_wallets WHERE wallet_id = $1 AND unfollowed_at IS NULL",
+            event.wallet_id,
+        )
+        wallet_mode    = fw_row["mode"] if fw_row else "paper"
+        effective_mode = "paper" if _dry_run_state["active"] else wallet_mode
+
+        size  = await calculate_size(conn, event.wallet_id, event)
         title = await _get_market_title(conn, event.condition_id)
 
-        if _dry_run_state["active"]:
+        if effective_mode == "paper":
             result = OrderResult(
                 status="paper",
                 size_filled=size,
                 price=event.price_at_event,
                 error_msg=None,
             )
-            await log_copy_order(conn, event, size, result)
+            await log_copy_order(conn, event, size, result, mode=effective_mode)
             go_live_ready = await check_go_live_gate(conn)
 
     # send_telegram uden for connection-blokken — frigiver DB-forbindelsen først
-    if _dry_run_state["active"]:
-        await send_telegram(_format_trade_msg("📄 PAPER", tag, event.outcome, event.price_at_event, size, title))
-        if go_live_ready:
-            await send_approval_request(go_live_ready[0], go_live_ready[1])
+    if effective_mode == "paper":
+        await send_telegram(
+            _format_trade_msg("📄 PAPER", tag, event.outcome, event.price_at_event, size, title),
+            mode=wallet_mode,
+        )
+        for wallet_data in go_live_ready:
+            await send_approval_request(**wallet_data)
         return
 
     # Live mode — CLOB-kald uden for connection context for at undgå timeout
     result = await submit_to_clob(event, size)
     async with acquire() as conn:
         title = await _get_market_title(conn, event.condition_id)
-        await log_copy_order(conn, event, size, result)
+        await log_copy_order(conn, event, size, result, mode=effective_mode)
 
     if result.status == "filled":
-        await send_telegram(_format_trade_msg("✅ LIVE", tag, event.outcome, result.price, result.size_filled, title))
+        await send_telegram(
+            _format_trade_msg("✅ LIVE", tag, event.outcome, result.price, result.size_filled, title),
+            mode=effective_mode,
+        )
     else:
-        await send_telegram(f"❌ <b>LIVE FEJL</b> — {tag}\n{result.error_msg}")
+        await send_telegram(f"❌ <b>LIVE FEJL</b> — {tag}\n{result.error_msg}", mode=effective_mode)
 
 
 # ── DB logging ──────────────────────────────────────────────────────────────────
@@ -457,6 +490,7 @@ async def log_copy_order(
     event: TradeEvent,
     size_requested: Decimal,
     result: OrderResult,
+    mode: str = "paper",
 ) -> None:
     """Indsæt i copy_orders og opdater daily_stats atomisk (ON CONFLICT DO UPDATE)."""
     # size_requested og size_filled er begge USDC-budget (ikke shares).
@@ -467,8 +501,8 @@ async def log_copy_order(
         """
         INSERT INTO copy_orders
             (source_wallet_id, trade_event_id, condition_id, outcome, side,
-             size_requested, size_filled, price, status, error_msg)
-        SELECT $1, $2, $3, $4, 'buy', $5, $6, $7, $8, $9
+             size_requested, size_filled, price, status, error_msg, mode)
+        SELECT $1, $2, $3, $4, 'buy', $5, $6, $7, $8, $9, $10
         WHERE NOT EXISTS (
             SELECT 1 FROM copy_orders
             WHERE source_wallet_id = $1
@@ -487,6 +521,7 @@ async def log_copy_order(
         result.price,
         result.status,
         result.error_msg,
+        mode,
     )
     await conn.execute(
         """
@@ -605,7 +640,7 @@ async def _update_resolved_orders() -> None:
                         WHERE condition_id = $1
                           AND won IS NULL
                           AND status IN ('paper', 'filled')
-                        RETURNING won, pnl_usdc, size_filled, price, source_wallet_id
+                        RETURNING won, pnl_usdc, size_filled, price, source_wallet_id, mode
                     )
                     SELECT upd.*, COALESCE(w.label, LEFT(w.address,6)||'…'||RIGHT(w.address,4)) AS wallet_tag
                     FROM upd
@@ -628,17 +663,21 @@ async def _update_resolved_orders() -> None:
                 result = "VANDT" if did_win else "TABTE"
                 # Saml wallet-navne (typisk kun 1, men kan være flere)
                 wallet_tags = ", ".join(dict.fromkeys(r["wallet_tag"] for r in rows_updated))
+                # Rut notifikation til korrekt bot (live hvis mindst én order er live)
+                notify_mode = "live" if any(r["mode"] == "live" for r in rows_updated) else "paper"
                 log.info(
-                    "Resolved %s → vinder: %s  (%d orders, P&L: %+.2f)",
+                    "Resolved %s → vinder: %s  (%d orders, P&L: %+.2f, mode: %s)",
                     condition_id[:12],
                     winning_outcome,
                     len(rows_updated),
                     total_pnl,
+                    notify_mode,
                 )
                 await send_telegram(
                     f"{emoji} <b>{result} · {wallet_tags}:</b> {title}\n"
                     f"Udfald: {winning_outcome.upper()}\n"
-                    f"Sim. P&amp;L: ${total_pnl:+.2f} USDC  (ROI {roi:+.1f}%)"
+                    f"Sim. P&amp;L: ${total_pnl:+.2f} USDC  (ROI {roi:+.1f}%)",
+                    mode=notify_mode,
                 )
         except asyncio.CancelledError:
             raise
