@@ -57,46 +57,26 @@ def _get_clob_client():
 async def get_clob_balance() -> Decimal:
     """GET /balance-allowance — returnerer tilgængeligt USDC fra CLOB API.
 
-    py_clob_client>=0.17 fjernede get_balance(). Vi prober kendte metodenavne
-    i prioriteret rækkefølge så koden overlever fremtidige library-opdateringer.
+    py_clob_client>=0.17 bruger get_balance_allowance(params) i stedet for
+    den fjernede get_balance(). Kalder med AssetType.USDC for at få USDC-saldo.
     """
+    from py_clob_client.clob_types import AssetType, BalanceAllowanceParams  # type: ignore[import]
+
     loop = asyncio.get_event_loop()
     try:
         clob = _get_clob_client()
-
-        # Kandidater i prioriteret rækkefølge (nyeste → ældste)
-        _CANDIDATE_METHODS = [
-            "get_balance_allowance",          # 0.17+
-            "get_collateral_balance",         # alternativt navn
-            "get_usdc_balance",
-            "get_balance",                    # <0.17 (beholdes som fallback)
-        ]
-
-        for method_name in _CANDIDATE_METHODS:
-            if not hasattr(clob, method_name):
-                continue
-            try:
-                resp = await loop.run_in_executor(None, getattr(clob, method_name))
-                if isinstance(resp, dict):
-                    for key in ("USDC", "balance", "usdc", "asset_allowance", "allowance"):
-                        if key in resp:
-                            return Decimal(str(resp[key]))
-                    log.debug("get_clob_balance via %s — ukendt dict-struktur: %s", method_name, resp)
-                    return Decimal("0")
-                # Skalærværdi (str/float/int)
-                return Decimal(str(resp))
-            except Exception:
-                log.debug("Metode %s fejlede — prøver næste", method_name, exc_info=True)
-                continue
-
-        # Ingen metode virkede — returner 0 så gaten degrader gracefully
-        log.error(
-            "get_clob_balance: ingen kendte metoder fundet på ClobClient "
-            "(tilgængelige: %s)",
-            [m for m in dir(clob) if not m.startswith("_")],
+        params = BalanceAllowanceParams(asset_type=AssetType.USDC)
+        resp = await loop.run_in_executor(
+            None, lambda: clob.get_balance_allowance(params)
         )
-        return Decimal("0")
-
+        if isinstance(resp, dict):
+            # Returnerer {"balance": "94.50", "allowance": "999999.00"}
+            for key in ("balance", "USDC", "usdc"):
+                if key in resp:
+                    return Decimal(str(resp[key]))
+            log.warning("get_clob_balance: uventet dict-struktur: %s", resp)
+            return Decimal("0")
+        return Decimal(str(resp)) if resp else Decimal("0")
     except Exception:
         log.exception("get_clob_balance fejlede")
         raise
