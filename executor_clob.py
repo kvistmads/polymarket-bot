@@ -55,14 +55,48 @@ def _get_clob_client():
 
 
 async def get_clob_balance() -> Decimal:
-    """GET /balance — returnerer tilgængeligt USDC fra CLOB API."""
+    """GET /balance-allowance — returnerer tilgængeligt USDC fra CLOB API.
+
+    py_clob_client>=0.17 fjernede get_balance(). Vi prober kendte metodenavne
+    i prioriteret rækkefølge så koden overlever fremtidige library-opdateringer.
+    """
     loop = asyncio.get_event_loop()
     try:
         clob = _get_clob_client()
-        resp = await loop.run_in_executor(None, clob.get_balance)
-        if isinstance(resp, dict):
-            return Decimal(str(resp.get("USDC", "0")))
-        return Decimal(str(resp))
+
+        # Kandidater i prioriteret rækkefølge (nyeste → ældste)
+        _CANDIDATE_METHODS = [
+            "get_balance_allowance",          # 0.17+
+            "get_collateral_balance",         # alternativt navn
+            "get_usdc_balance",
+            "get_balance",                    # <0.17 (beholdes som fallback)
+        ]
+
+        for method_name in _CANDIDATE_METHODS:
+            if not hasattr(clob, method_name):
+                continue
+            try:
+                resp = await loop.run_in_executor(None, getattr(clob, method_name))
+                if isinstance(resp, dict):
+                    for key in ("USDC", "balance", "usdc", "asset_allowance", "allowance"):
+                        if key in resp:
+                            return Decimal(str(resp[key]))
+                    log.debug("get_clob_balance via %s — ukendt dict-struktur: %s", method_name, resp)
+                    return Decimal("0")
+                # Skalærværdi (str/float/int)
+                return Decimal(str(resp))
+            except Exception:
+                log.debug("Metode %s fejlede — prøver næste", method_name, exc_info=True)
+                continue
+
+        # Ingen metode virkede — returner 0 så gaten degrader gracefully
+        log.error(
+            "get_clob_balance: ingen kendte metoder fundet på ClobClient "
+            "(tilgængelige: %s)",
+            [m for m in dir(clob) if not m.startswith("_")],
+        )
+        return Decimal("0")
+
     except Exception:
         log.exception("get_clob_balance fejlede")
         raise
