@@ -57,26 +57,56 @@ def _get_clob_client():
 async def get_clob_balance() -> Decimal:
     """GET /balance-allowance — returnerer tilgængeligt USDC fra CLOB API.
 
-    py_clob_client>=0.17 bruger get_balance_allowance(params) i stedet for
-    den fjernede get_balance(). Kalder med AssetType.USDC for at få USDC-saldo.
+    py_clob_client>=0.17 bruger get_balance_allowance(params).
+    AssetType-enum'en varierer mellem versioner, så vi finder USDC-værdien
+    ved at kalde uden params (returnerer alle assets) og summerer USDC-feltet.
     """
-    from py_clob_client.clob_types import AssetType, BalanceAllowanceParams  # type: ignore[import]
-
     loop = asyncio.get_event_loop()
     try:
         clob = _get_clob_client()
-        params = BalanceAllowanceParams(asset_type=AssetType.USDC)
+
+        # Forsøg 1: kald uden params — returnerer ofte dict over alle assets
+        try:
+            resp = await loop.run_in_executor(None, clob.get_balance_allowance)
+            if isinstance(resp, dict):
+                for key in ("balance", "USDC", "usdc"):
+                    if key in resp:
+                        return Decimal(str(resp[key]))
+                # Kan også være nested: {"USDC": {"balance": "94.5"}, ...}
+                usdc_section = resp.get("USDC") or resp.get("usdc")
+                if isinstance(usdc_section, dict):
+                    for key in ("balance", "amount"):
+                        if key in usdc_section:
+                            return Decimal(str(usdc_section[key]))
+                log.warning("get_clob_balance: uventet struktur (ingen params): %s", resp)
+        except TypeError:
+            # Metoden kræver params — fortsæt til forsøg 2
+            pass
+
+        # Forsøg 2: find USDC enum-værdien dynamisk
+        from py_clob_client.clob_types import AssetType, BalanceAllowanceParams  # type: ignore[import]
+        usdc_asset = None
+        for attr in ("USDC", "Usdc", "usdc", "COLLATERAL", "ERC20"):
+            if hasattr(AssetType, attr):
+                usdc_asset = getattr(AssetType, attr)
+                break
+        if usdc_asset is None:
+            # Brug første ikke-CTF enum-værdi
+            candidates = [v for v in AssetType if "CTF" not in str(v).upper()]
+            usdc_asset = candidates[0] if candidates else list(AssetType)[0]
+
+        params = BalanceAllowanceParams(asset_type=usdc_asset)
         resp = await loop.run_in_executor(
             None, lambda: clob.get_balance_allowance(params)
         )
         if isinstance(resp, dict):
-            # Returnerer {"balance": "94.50", "allowance": "999999.00"}
-            for key in ("balance", "USDC", "usdc"):
+            for key in ("balance", "USDC", "usdc", "amount"):
                 if key in resp:
                     return Decimal(str(resp[key]))
-            log.warning("get_clob_balance: uventet dict-struktur: %s", resp)
+            log.warning("get_clob_balance: uventet struktur (med params): %s", resp)
             return Decimal("0")
         return Decimal(str(resp)) if resp else Decimal("0")
+
     except Exception:
         log.exception("get_clob_balance fejlede")
         raise
