@@ -56,6 +56,8 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
       TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID}
+      TELEGRAM_BOT_TOKEN_LIVE: ${TELEGRAM_BOT_TOKEN_LIVE:-}
+      TELEGRAM_CHAT_ID_LIVE: ${TELEGRAM_CHAT_ID_LIVE:-}
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8081/health"]
       interval: 30s
