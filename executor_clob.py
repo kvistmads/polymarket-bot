@@ -234,7 +234,7 @@ async def sell_from_clob(event: TradeEvent, shares: Decimal) -> OrderResult:
 
 async def _place_fok_sell_order(token_id: str, price: Decimal, shares: Decimal) -> OrderResult:
     """Opret og send én FOK SELL limit ordre."""
-    from py_clob_client.clob_types import OrderArgs, OrderType, Side  # type: ignore[import]
+    from py_clob_client.clob_types import OrderArgs, OrderType  # type: ignore[import]
 
     loop = asyncio.get_event_loop()
     clob = _get_clob_client()
@@ -243,7 +243,7 @@ async def _place_fok_sell_order(token_id: str, price: Decimal, shares: Decimal) 
         token_id=token_id,
         price=float(price),
         size=float(shares),
-        side=Side.SELL,
+        side="SELL",
         fee_rate_bps=0,
         nonce=0,
         expiration=0,
@@ -270,7 +270,7 @@ async def _place_fok_sell_order(token_id: str, price: Decimal, shares: Decimal) 
 
 async def _place_fok_order(token_id: str, price: Decimal, size: Decimal) -> OrderResult:
     """Opret og send én FOK BUY limit ordre. Kaldt kun fra submit_to_clob."""
-    from py_clob_client.clob_types import OrderArgs, OrderType, Side  # type: ignore[import]
+    from py_clob_client.clob_types import OrderArgs, OrderType  # type: ignore[import]
 
     loop = asyncio.get_event_loop()
     clob = _get_clob_client()
@@ -279,7 +279,7 @@ async def _place_fok_order(token_id: str, price: Decimal, size: Decimal) -> Orde
         token_id=token_id,
         price=float(price),
         size=float(size),
-        side=Side.BUY,
+        side="BUY",
         fee_rate_bps=0,
         nonce=0,
         expiration=0,
