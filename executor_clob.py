@@ -55,31 +55,56 @@ def _get_clob_client():
 
 
 async def get_clob_balance() -> Decimal:
-    """GET /balance-allowance — returnerer tilgængeligt USDC fra CLOB API.
+    """Læser USDC-balance direkte fra Polygon blockchain via JSON-RPC.
 
-    py_clob_client>=0.17: get_balance_allowance(BalanceAllowanceParams).
-    AssetType.COLLATERAL = USDC (collateral token på Polymarket).
+    CLOB API'ets /balance-allowance viser kun pre-deposited beløb, ikke
+    wallet-balancen. Vi læser i stedet direkte fra USDC ERC-20 kontrakten.
+    Prøver begge USDC-kontrakter på Polygon (native + bridged).
     """
-    from py_clob_client.clob_types import AssetType, BalanceAllowanceParams  # type: ignore[import]
+    clob = _get_clob_client()
+    wallet = clob.get_address()
 
-    loop = asyncio.get_event_loop()
-    try:
-        clob = _get_clob_client()
-        params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
-        resp = await loop.run_in_executor(
-            None, lambda: clob.get_balance_allowance(params)
-        )
-        if isinstance(resp, dict):
-            # Returnerer {"balance": "94.50", "allowance": "999999.00"}
-            for key in ("balance", "USDC", "usdc", "amount"):
-                if key in resp:
-                    return Decimal(str(resp[key]))
-            log.warning("get_clob_balance: uventet dict-struktur: %s", resp)
-            return Decimal("0")
-        return Decimal(str(resp)) if resp else Decimal("0")
-    except Exception:
-        log.exception("get_clob_balance fejlede")
-        raise
+    # ERC-20 balanceOf(address) selector + 32-byte padded address
+    padded = wallet[2:].lower().zfill(64)
+    data = "0x70a08231" + padded
+
+    # Polygon USDC-kontrakter (native USDC og USDC.e/PoS-bridged)
+    usdc_contracts = [
+        "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359",  # Native USDC (Circle)
+        "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174",  # USDC.e (bridged)
+    ]
+    polygon_rpcs = [
+        "https://polygon-rpc.com",
+        "https://rpc-mainnet.matic.network",
+    ]
+
+    total = Decimal("0")
+    async with httpx.AsyncClient(timeout=10) as client:
+        for rpc in polygon_rpcs:
+            try:
+                for contract in usdc_contracts:
+                    r = await client.post(
+                        rpc,
+                        json={
+                            "jsonrpc": "2.0",
+                            "method": "eth_call",
+                            "params": [{"to": contract, "data": data}, "latest"],
+                            "id": 1,
+                        },
+                    )
+                    result = r.json().get("result", "0x0")
+                    raw = int(result, 16)
+                    if raw > 0:
+                        total += Decimal(raw) / Decimal(10**6)
+                if total > 0:
+                    log.debug("get_clob_balance: %s USDC (wallet %s)", total, wallet)
+                    return total
+            except Exception:
+                log.debug("RPC %s fejlede — prøver næste", rpc, exc_info=True)
+                continue
+
+    log.warning("get_clob_balance: kunne ikke læse balance for %s", wallet)
+    return Decimal("0")
 
 
 async def get_clob_orderbook(token_id: str) -> dict:
