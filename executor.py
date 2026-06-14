@@ -917,13 +917,39 @@ async def main() -> None:
     # Registrér Telegram-kommandoer
     register_command("/portfolio", _portfolio_command_handler)
 
-    # Startup-notifikation til Telegram
-    mode = "🧪 PAPER" if _dry_run_state["active"] else "🔴 LIVE"
-    await send_telegram(
-        f"🚀 <b>Executor genstartet</b>\n"
-        f"Tilstand: {mode}\n"
-        f"Tid: {datetime.now(timezone.utc).strftime('%d/%m %H:%M UTC')}"
-    )
+    # Startup-notifikation — én til copy-bot (overblik), én til live-bot (hvis aktiv)
+    tid = datetime.now(timezone.utc).strftime("%d/%m %H:%M UTC")
+    async with acquire() as conn:
+        wallet_rows = await conn.fetch(
+            """
+            SELECT COALESCE(w.label, LEFT(w.address,6)||'…'||RIGHT(w.address,4)) AS tag,
+                   fw.mode
+            FROM followed_wallets fw
+            JOIN wallets w ON w.id = fw.wallet_id
+            WHERE fw.unfollowed_at IS NULL
+            ORDER BY fw.mode DESC, w.label
+            """
+        )
+    paper_wallets = [r["tag"] for r in wallet_rows if r["mode"] == "paper"]
+    live_wallets  = [r["tag"] for r in wallet_rows if r["mode"] == "live"]
+
+    # Copy-bot: altid én besked med tydeligt overblik over begge spor
+    paper_lines = [f"🚀 <b>Executor genstartet</b> — {tid}", ""]
+    if paper_wallets:
+        paper_lines.append(f"📄 <b>Paper:</b> {', '.join(paper_wallets)}")
+    if live_wallets:
+        paper_lines.append(f"🔴 <b>Live</b> (notif. → live-bot): {', '.join(live_wallets)}")
+    if not paper_wallets and not live_wallets:
+        paper_lines.append("Ingen fulgte wallets")
+    await send_telegram("\n".join(paper_lines), mode="paper")
+
+    # Live-bot: kun hvis DRY_RUN=false og der er live wallets
+    if live_wallets and not _dry_run_state["active"]:
+        await send_telegram(
+            f"🚀 <b>Executor live</b> — {tid}\n"
+            f"🔴 Følger: {', '.join(live_wallets)}",
+            mode="live",
+        )
 
     loop = asyncio.get_event_loop()
     listen_task = loop.create_task(listen_loop())
