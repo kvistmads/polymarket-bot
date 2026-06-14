@@ -174,8 +174,8 @@ async def submit_to_clob(event: TradeEvent, size: Decimal) -> OrderResult:
             )
 
         best_ask = Decimal(str(asks[0]["price"]))
-        # FOK med 0.3% slippage simulerer market order
-        order_price = min(best_ask * Decimal("1.003"), Decimal("1.0"))
+        # FOK med 0.3% slippage simulerer market order — CLOB max er 0.99
+        order_price = min(best_ask * Decimal("1.003"), Decimal("0.99"))
 
         return await _place_fok_order(token_id, order_price, size)
 
