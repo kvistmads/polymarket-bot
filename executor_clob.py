@@ -58,52 +58,57 @@ async def get_clob_balance() -> Decimal:
     """Læser USDC-balance direkte fra Polygon blockchain via JSON-RPC.
 
     CLOB API'ets /balance-allowance viser kun pre-deposited beløb, ikke
-    wallet-balancen. Vi læser i stedet direkte fra USDC ERC-20 kontrakten.
-    Prøver begge USDC-kontrakter på Polygon (native + bridged).
+    wallet-balancen. Vi læser direkte fra USDC ERC-20 kontrakterne.
     """
     clob = _get_clob_client()
     wallet = clob.get_address()
 
-    # ERC-20 balanceOf(address) selector + 32-byte padded address
+    # ERC-20 balanceOf(address): selector 0x70a08231 + 32-byte padded address
     padded = wallet[2:].lower().zfill(64)
     data = "0x70a08231" + padded
 
     # Polygon USDC-kontrakter (native USDC og USDC.e/PoS-bridged)
     usdc_contracts = [
-        "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359",  # Native USDC (Circle)
-        "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174",  # USDC.e (bridged)
+        ("0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359", "Native USDC"),
+        ("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174", "USDC.e"),
     ]
     polygon_rpcs = [
+        "https://polygon.llamarpc.com",
         "https://polygon-rpc.com",
-        "https://rpc-mainnet.matic.network",
+        "https://1rpc.io/matic",
+        "https://polygon.meowrpc.com",
     ]
 
-    total = Decimal("0")
-    async with httpx.AsyncClient(timeout=10) as client:
+    async with httpx.AsyncClient(timeout=15) as client:
         for rpc in polygon_rpcs:
+            total = Decimal("0")
             try:
-                for contract in usdc_contracts:
+                for contract_addr, contract_name in usdc_contracts:
                     r = await client.post(
                         rpc,
                         json={
                             "jsonrpc": "2.0",
                             "method": "eth_call",
-                            "params": [{"to": contract, "data": data}, "latest"],
+                            "params": [{"to": contract_addr, "data": data}, "latest"],
                             "id": 1,
                         },
                     )
-                    result = r.json().get("result", "0x0")
+                    resp_json = r.json()
+                    result = resp_json.get("result", "0x0") or "0x0"
                     raw = int(result, 16)
-                    if raw > 0:
-                        total += Decimal(raw) / Decimal(10**6)
-                if total > 0:
-                    log.debug("get_clob_balance: %s USDC (wallet %s)", total, wallet)
-                    return total
+                    amount = Decimal(raw) / Decimal(10**6)
+                    log.debug(
+                        "get_clob_balance: %s @ %s = %s USDC",
+                        contract_name, rpc, amount,
+                    )
+                    total += amount
+                log.info("get_clob_balance: %s USDC total (via %s)", total, rpc)
+                return total
             except Exception:
-                log.debug("RPC %s fejlede — prøver næste", rpc, exc_info=True)
+                log.warning("RPC %s fejlede — prøver næste", rpc, exc_info=True)
                 continue
 
-    log.warning("get_clob_balance: kunne ikke læse balance for %s", wallet)
+    log.error("get_clob_balance: alle RPCs fejlede for wallet %s", wallet)
     return Decimal("0")
 
 
