@@ -73,10 +73,10 @@ async def get_clob_balance() -> Decimal:
         ("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174", "USDC.e"),
     ]
     polygon_rpcs = [
-        "https://polygon.llamarpc.com",
-        "https://polygon-rpc.com",
-        "https://1rpc.io/matic",
-        "https://polygon.meowrpc.com",
+        "https://rpc.ankr.com/polygon",               # Ankr — gratis, ingen auth
+        "https://polygon-bor-rpc.publicnode.com",     # PublicNode
+        "https://polygon.blockpi.network/v1/rpc/public",  # BlockPI public
+        "https://rpc-mainnet.maticvigil.com",         # MaticVigil
     ]
 
     async with httpx.AsyncClient(timeout=15) as client:
