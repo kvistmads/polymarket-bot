@@ -243,7 +243,12 @@ async def sell_from_clob(event: TradeEvent, shares: Decimal) -> OrderResult:
 
 async def _place_fok_sell_order(token_id: str, price: Decimal, shares: Decimal) -> OrderResult:
     """Opret og send én FOK SELL limit ordre."""
-    from py_clob_client.clob_types import OrderArgs, OrderType  # type: ignore[import]
+    import json as _json
+    from py_clob_client.clob_types import OrderArgs, OrderType, RequestArgs  # type: ignore[import]
+    from py_clob_client.utilities import order_to_json  # type: ignore[import]
+    from py_clob_client.http_helpers.helpers import post as _clob_post  # type: ignore[import]
+    from py_clob_client.endpoints import POST_ORDER  # type: ignore[import]
+    from py_clob_client.headers.headers import create_level_2_headers  # type: ignore[import]
 
     loop = asyncio.get_event_loop()
     clob = _get_clob_client()
@@ -258,9 +263,17 @@ async def _place_fok_sell_order(token_id: str, price: Decimal, shares: Decimal) 
         expiration=0,
     )
     signed = await loop.run_in_executor(None, clob.create_order, order_args)
-    resp = await loop.run_in_executor(
-        None, lambda: clob.post_order(signed, OrderType.FOK)
-    )
+
+    # Polymarket's nye API kræver version-felt i order dict
+    def _post_with_version():
+        body = order_to_json(signed, clob.creds.api_key, OrderType.FOK, False)
+        body["order"]["version"] = "5.0"
+        serialized = _json.dumps(body, separators=(",", ":"), ensure_ascii=False)
+        req = RequestArgs(method="POST", request_path=POST_ORDER, body=body, serialized_body=serialized)
+        headers = create_level_2_headers(clob.signer, clob.creds, req)
+        return _clob_post("{}{}".format(clob.host, POST_ORDER), headers=headers, data=serialized)
+
+    resp = await loop.run_in_executor(None, _post_with_version)
 
     if isinstance(resp, dict) and resp.get("status") == "matched":
         return OrderResult(
@@ -279,7 +292,12 @@ async def _place_fok_sell_order(token_id: str, price: Decimal, shares: Decimal) 
 
 async def _place_fok_order(token_id: str, price: Decimal, size: Decimal) -> OrderResult:
     """Opret og send én FOK BUY limit ordre. Kaldt kun fra submit_to_clob."""
-    from py_clob_client.clob_types import OrderArgs, OrderType  # type: ignore[import]
+    import json as _json
+    from py_clob_client.clob_types import OrderArgs, OrderType, RequestArgs  # type: ignore[import]
+    from py_clob_client.utilities import order_to_json  # type: ignore[import]
+    from py_clob_client.http_helpers.helpers import post as _clob_post  # type: ignore[import]
+    from py_clob_client.endpoints import POST_ORDER  # type: ignore[import]
+    from py_clob_client.headers.headers import create_level_2_headers  # type: ignore[import]
 
     loop = asyncio.get_event_loop()
     clob = _get_clob_client()
@@ -294,9 +312,17 @@ async def _place_fok_order(token_id: str, price: Decimal, size: Decimal) -> Orde
         expiration=0,
     )
     signed = await loop.run_in_executor(None, clob.create_order, order_args)
-    resp = await loop.run_in_executor(
-        None, lambda: clob.post_order(signed, OrderType.FOK)
-    )
+
+    # Polymarket's nye API kræver version-felt i order dict
+    def _post_with_version():
+        body = order_to_json(signed, clob.creds.api_key, OrderType.FOK, False)
+        body["order"]["version"] = "5.0"
+        serialized = _json.dumps(body, separators=(",", ":"), ensure_ascii=False)
+        req = RequestArgs(method="POST", request_path=POST_ORDER, body=body, serialized_body=serialized)
+        headers = create_level_2_headers(clob.signer, clob.creds, req)
+        return _clob_post("{}{}".format(clob.host, POST_ORDER), headers=headers, data=serialized)
+
+    resp = await loop.run_in_executor(None, _post_with_version)
 
     if isinstance(resp, dict) and resp.get("status") == "matched":
         return OrderResult(
