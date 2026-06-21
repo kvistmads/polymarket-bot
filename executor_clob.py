@@ -264,16 +264,16 @@ async def _place_fok_sell_order(token_id: str, price: Decimal, shares: Decimal) 
     )
     signed = await loop.run_in_executor(None, clob.create_order, order_args)
 
-    # Polymarket's nye API kræver version-felt i order dict
-    def _post_with_version():
+    # JS-klienten sender deferExec:false i body — bruges af Polymarket til klientversion-check
+    def _post_patched():
         body = order_to_json(signed, clob.creds.api_key, OrderType.FOK, False)
-        body["order"]["version"] = "5.0"
+        body["deferExec"] = False
         serialized = _json.dumps(body, separators=(",", ":"), ensure_ascii=False)
         req = RequestArgs(method="POST", request_path=POST_ORDER, body=body, serialized_body=serialized)
         headers = create_level_2_headers(clob.signer, clob.creds, req)
         return _clob_post("{}{}".format(clob.host, POST_ORDER), headers=headers, data=serialized)
 
-    resp = await loop.run_in_executor(None, _post_with_version)
+    resp = await loop.run_in_executor(None, _post_patched)
 
     if isinstance(resp, dict) and resp.get("status") == "matched":
         return OrderResult(
@@ -313,16 +313,16 @@ async def _place_fok_order(token_id: str, price: Decimal, size: Decimal) -> Orde
     )
     signed = await loop.run_in_executor(None, clob.create_order, order_args)
 
-    # Polymarket's nye API kræver version-felt i order dict
-    def _post_with_version():
+    # JS-klienten sender deferExec:false i body — bruges af Polymarket til klientversion-check
+    def _post_patched():
         body = order_to_json(signed, clob.creds.api_key, OrderType.FOK, False)
-        body["order"]["version"] = "5.0"
+        body["deferExec"] = False
         serialized = _json.dumps(body, separators=(",", ":"), ensure_ascii=False)
         req = RequestArgs(method="POST", request_path=POST_ORDER, body=body, serialized_body=serialized)
         headers = create_level_2_headers(clob.signer, clob.creds, req)
         return _clob_post("{}{}".format(clob.host, POST_ORDER), headers=headers, data=serialized)
 
-    resp = await loop.run_in_executor(None, _post_with_version)
+    resp = await loop.run_in_executor(None, _post_patched)
 
     if isinstance(resp, dict) and resp.get("status") == "matched":
         return OrderResult(
