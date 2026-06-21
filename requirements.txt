@@ -8,7 +8,7 @@ requests==2.31.0
 aiohttp==3.9.5
 python-telegram-bot==21.3
 py-clob-client>=0.34.6
-py-order-utils @ git+https://github.com/Polymarket/py-order-utils.git
+py-order-utils @ https://github.com/Polymarket/py-order-utils/archive/refs/heads/main.zip
 ruff==0.4.4
 black==24.4.2
 mypy==1.10.0
