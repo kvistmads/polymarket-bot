@@ -40,6 +40,15 @@ def _get_clob_client():
         return _clob_client
 
     from py_clob_client.client import ClobClient  # type: ignore[import]
+    import py_clob_client.http_helpers.helpers as _clob_http  # type: ignore[import]
+
+    # py_clob_client opretter _http_client som modul-niveau singleton uden proxy.
+    # Patch den manuelt hvis HTTPS_PROXY er sat i env.
+    proxy_url = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
+    if proxy_url:
+        import httpx as _httpx
+        _clob_http._http_client = _httpx.Client(http2=True, proxy=proxy_url)
+        log.info("CLOB HTTP-klient patched med proxy (url redacted)")
 
     key = os.environ["POLYMARKET_PRIVATE_KEY"]
     # py_clob_client >= 0.17 bruger 'key' i stedet for 'private_key'
