@@ -24,7 +24,7 @@ def upgrade() -> None:
     """)
     op.execute("""
         ALTER TABLE followed_wallets
-        ADD CONSTRAINT IF NOT EXISTS followed_wallets_mode_check
+        ADD CONSTRAINT followed_wallets_mode_check
         CHECK (mode IN ('paper', 'live'))
     """)
 
@@ -35,7 +35,7 @@ def upgrade() -> None:
     """)
     op.execute("""
         ALTER TABLE copy_orders
-        ADD CONSTRAINT IF NOT EXISTS copy_orders_mode_check
+        ADD CONSTRAINT copy_orders_mode_check
         CHECK (mode IN ('paper', 'live'))
     """)
 
