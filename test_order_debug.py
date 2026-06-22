@@ -30,8 +30,10 @@ if not DEPOSIT_WALLET:
     exit(1)
 
 print(f"Initialiserer CLOB V2 klient med deposit wallet...")
-client = ClobClient(host=HOST, chain_id=CHAIN_ID, key=KEY)
-creds = client.create_or_derive_api_key()
+# API-nøglen oprettes på POLY_1271-klienten med funder, så signer-adressen matcher deposit wallet
+tmp = ClobClient(host=HOST, chain_id=CHAIN_ID, key=KEY,
+                 signature_type=SignatureTypeV2.POLY_1271, funder=DEPOSIT_WALLET)
+creds = tmp.create_or_derive_api_key()
 client = ClobClient(
     host=HOST,
     chain_id=CHAIN_ID,
