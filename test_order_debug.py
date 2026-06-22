@@ -31,10 +31,18 @@ clob.set_api_creds(creds)
 print(f"Wallet: {clob.get_address()}")
 print(f"Token:  {TOKEN_ID[:20]}...")
 
-# Opret ordre med meget lav pris — FOK vil afvises men vi ser API-svaret
+# Tjek neg_risk for dette token
+neg = clob.get_neg_risk(TOKEN_ID)
+print(f"neg_risk: {neg}")
+
+# Tjek tick_size
+ts = clob.get_tick_size(TOKEN_ID)
+print(f"tick_size: {ts}")
+
+# Opret ordre med tick_size som pris
 order_args = OrderArgs(
     token_id=TOKEN_ID,
-    price=0.01,
+    price=float(ts),
     size=1.0,
     side="BUY",
     fee_rate_bps=0,
@@ -45,6 +53,12 @@ order_args = OrderArgs(
 print("\nOpretter ordre...")
 signed = clob.create_order(order_args)
 print("Ordre signeret OK")
+
+# Print fuldt order dict (uden signature)
+od = signed.dict()
+od_safe = {k: v for k, v in od.items() if k != "signature"}
+od_safe["signature"] = "REDACTED"
+print(f"Order dict: {json.dumps(od_safe, indent=2, default=str)}")
 
 # Test 1: original post_order (ingen patches)
 print("\n--- TEST 1: Upatched clob.post_order() ---")
