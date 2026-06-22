@@ -469,6 +469,15 @@ async def process_trade_event(event: TradeEvent) -> None:
 
     # Live mode — CLOB-kald uden for connection context for at undgå timeout
     result = await submit_to_clob(event, size)
+
+    # "skipped" = thin market (ingen asks) — ikke en fejl, log stille
+    if result.status == "skipped":
+        log.debug(
+            "[%s] Trade skipped (thin market): %s/%s",
+            tag, event.condition_id[:12], event.outcome,
+        )
+        return
+
     async with acquire() as conn:
         title = await _get_market_title(conn, event.condition_id)
         await log_copy_order(conn, event, size, result, mode=effective_mode)
