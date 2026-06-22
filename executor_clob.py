@@ -313,14 +313,24 @@ async def _place_fok_order(token_id: str, price: Decimal, size: Decimal) -> Orde
     )
     signed = await loop.run_in_executor(None, clob.create_order, order_args)
 
-    # JS-klienten sender deferExec:false i body — bruges af Polymarket til klientversion-check
+    # Debug: log hvad vi sender så vi kan sammenligne med JS-klienten
     def _post_patched():
         body = order_to_json(signed, clob.creds.api_key, OrderType.FOK, False)
         body["deferExec"] = False
         serialized = _json.dumps(body, separators=(",", ":"), ensure_ascii=False)
+        debug_body = _json.loads(serialized)
+        debug_body["order"]["signature"] = "REDACTED"
+        log.warning("ORDER_DEBUG BODY: %s", _json.dumps(debug_body, indent=2))
         req = RequestArgs(method="POST", request_path=POST_ORDER, body=body, serialized_body=serialized)
         headers = create_level_2_headers(clob.signer, clob.creds, req)
-        return _clob_post("{}{}".format(clob.host, POST_ORDER), headers=headers, data=serialized)
+        import httpx as _httpx
+        raw = _httpx.post(
+            "{}{}".format(clob.host, POST_ORDER),
+            headers={**headers, "Content-Type": "application/json", "User-Agent": "py_clob_client"},
+            content=serialized.encode("utf-8"),
+        )
+        log.warning("ORDER_DEBUG RESPONSE status=%s body=%s", raw.status_code, raw.text[:500])
+        return raw.json() if raw.status_code == 200 else {"error": raw.text}
 
     resp = await loop.run_in_executor(None, _post_patched)
 
