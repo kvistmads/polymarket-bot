@@ -62,16 +62,21 @@ def _get_clob_client():
     key = os.environ["POLYMARKET_PRIVATE_KEY"]
     deposit_wallet = os.environ["DEPOSIT_WALLET_ADDRESS"]
 
-    # Trin 1: L1-klient til at hente/oprette API-credentials
-    tmp = ClobClient(host=CLOB_BASE, chain_id=_CHAIN_ID, key=key)
+    # API-nøglen skal oprettes på en POLY_1271-klient med funder sat,
+    # så nøglens adresse matcher deposit wallet (order signer) — ikke EOA.
+    tmp = ClobClient(
+        host=CLOB_BASE,
+        chain_id=_CHAIN_ID,
+        key=key,
+        signature_type=SignatureTypeV2.POLY_1271,
+        funder=deposit_wallet,
+    )
     try:
         creds = tmp.create_or_derive_api_key()
     except Exception:
         log.exception("Kunne ikke hente CLOB V2 API credentials")
         raise
 
-    # Trin 2: Fuldt autentificeret klient med POLY_1271 signature type
-    # og deposit wallet som funder (V2-krav — EOA kan ikke placere ordrer direkte)
     _clob_client = ClobClient(
         host=CLOB_BASE,
         chain_id=_CHAIN_ID,
