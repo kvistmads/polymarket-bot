@@ -47,14 +47,20 @@ _clob_client = None
 
 
 def _get_clob_client():
-    """Returnér singleton ClobClient (V2). Initialiseret ved første kald (live mode)."""
+    """Returnér singleton ClobClient (V2). Initialiseret ved første kald (live mode).
+
+    Kræver DEPOSIT_WALLET_ADDRESS i env — deploy via polymarket.com frontend
+    eller py-builder-relayer-client. Deposit wallet skal holde pUSD og have
+    godkendt V2 exchange-kontrakten.
+    """
     global _clob_client
     if _clob_client is not None:
         return _clob_client
 
-    from py_clob_client_v2 import ClobClient  # type: ignore[import]
+    from py_clob_client_v2 import ClobClient, SignatureTypeV2  # type: ignore[import]
 
     key = os.environ["POLYMARKET_PRIVATE_KEY"]
+    deposit_wallet = os.environ["DEPOSIT_WALLET_ADDRESS"]
 
     # Trin 1: L1-klient til at hente/oprette API-credentials
     tmp = ClobClient(host=CLOB_BASE, chain_id=_CHAIN_ID, key=key)
@@ -64,9 +70,20 @@ def _get_clob_client():
         log.exception("Kunne ikke hente CLOB V2 API credentials")
         raise
 
-    # Trin 2: Fuldt autentificeret klient (L1 + L2)
-    _clob_client = ClobClient(host=CLOB_BASE, chain_id=_CHAIN_ID, key=key, creds=creds)
-    log.info("CLOB V2 client initialiseret (key redacted)")
+    # Trin 2: Fuldt autentificeret klient med POLY_1271 signature type
+    # og deposit wallet som funder (V2-krav — EOA kan ikke placere ordrer direkte)
+    _clob_client = ClobClient(
+        host=CLOB_BASE,
+        chain_id=_CHAIN_ID,
+        key=key,
+        creds=creds,
+        signature_type=SignatureTypeV2.POLY_1271,
+        funder=deposit_wallet,
+    )
+    log.info(
+        "CLOB V2 client initialiseret (key redacted, deposit_wallet=%s…)",
+        deposit_wallet[:10],
+    )
     return _clob_client
 
 
