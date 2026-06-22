@@ -24,13 +24,9 @@ FUNDER = os.environ.get("POLYMARKET_FUNDER_ADDRESS") or os.environ.get("FUNDER_A
 # Token fra Bobe2's seneste trade
 TOKEN_ID = "77911208241982327373495855644935587349201177208106713081551029073015187679590"
 
-clob = ClobClient(
-    "https://clob.polymarket.com",
-    key=KEY,
-    chain_id=137,
-    signature_type=0,
-    funder=FUNDER,
-)
+clob = ClobClient(host="https://clob.polymarket.com", key=KEY, chain_id=137, signature_type=0)
+creds = clob.create_or_derive_api_creds()
+clob.set_api_creds(creds)
 
 print(f"Wallet: {clob.get_address()}")
 print(f"Token:  {TOKEN_ID[:20]}...")
