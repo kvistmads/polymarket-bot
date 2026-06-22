@@ -50,6 +50,7 @@ services:
     environment:
       DB_URL: postgresql+asyncpg://bot:${POSTGRES_PASSWORD}@postgres/polymarket
       POLYMARKET_PRIVATE_KEY: ${POLYMARKET_PRIVATE_KEY}
+      DEPOSIT_WALLET_ADDRESS: ${DEPOSIT_WALLET_ADDRESS}
       MAX_DAILY_LOSS: ${MAX_DAILY_LOSS:-50}
       POSITION_SIZE_PCT: ${POSITION_SIZE_PCT:-0.05}
       DRY_RUN: ${DRY_RUN:-true}
