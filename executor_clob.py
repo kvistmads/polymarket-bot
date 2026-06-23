@@ -49,33 +49,32 @@ _clob_client = None
 def _get_clob_client():
     """Returnér singleton ClobClient (V2). Initialiseret ved første kald (live mode).
 
-    Kræver DEPOSIT_WALLET_ADDRESS i env — deploy via polymarket.com frontend
-    eller py-builder-relayer-client. Deposit wallet skal holde pUSD og have
-    godkendt V2 exchange-kontrakten.
+    Kræver CLOB_API_KEY, CLOB_SECRET og CLOB_PASSPHRASE i env — ekstraheret fra
+    Polymarket frontend via localStorage['poly_clob_api_key_map'][deposit_wallet].
+
+    Baggrund: py-clob-client-v2 har en bug hvor create_or_derive_api_key() altid
+    binder nøglen til EOA via L1-auth, men POLY_1271-ordrer sætter order.signer =
+    deposit_wallet. CLOB API tjekker order.signer == api_key.owner, så de matcher
+    aldrig. Løsning: brug browser-oprettede credentials direkte (de er korrekt
+    bundet til deposit wallet via EIP-1271 wrapped L1-auth).
     """
     global _clob_client
     if _clob_client is not None:
         return _clob_client
 
     from py_clob_client_v2 import ClobClient, SignatureTypeV2  # type: ignore[import]
+    from py_clob_client_v2.clob_types import ApiCreds  # type: ignore[import]
 
     key = os.environ["POLYMARKET_PRIVATE_KEY"]
     deposit_wallet = os.environ["DEPOSIT_WALLET_ADDRESS"]
 
-    # API-nøglen skal oprettes på en POLY_1271-klient med funder sat,
-    # så nøglens adresse matcher deposit wallet (order signer) — ikke EOA.
-    tmp = ClobClient(
-        host=CLOB_BASE,
-        chain_id=_CHAIN_ID,
-        key=key,
-        signature_type=SignatureTypeV2.POLY_1271,
-        funder=deposit_wallet,
+    # Credentials er oprettet af Polymarket-frontend og bundet til deposit wallet.
+    # Brug ApiCreds direkte — kald ALDRIG create_or_derive_api_key() (SDK-bug).
+    creds = ApiCreds(
+        api_key=os.environ["CLOB_API_KEY"],
+        api_secret=os.environ["CLOB_SECRET"],
+        api_passphrase=os.environ["CLOB_PASSPHRASE"],
     )
-    try:
-        creds = tmp.create_or_derive_api_key()
-    except Exception:
-        log.exception("Kunne ikke hente CLOB V2 API credentials")
-        raise
 
     _clob_client = ClobClient(
         host=CLOB_BASE,
