@@ -94,11 +94,13 @@ def _get_clob_client():
 async def get_clob_balance() -> Decimal:
     """Læser pUSD-balance direkte fra Polygon blockchain via JSON-RPC.
 
+    Bruger DEPOSIT_WALLET_ADDRESS fra env — ikke clob.get_address() som
+    returnerer EOA-adressen. pUSD ligger i deposit wallet, ikke EOA.
+
     V2 collateral er pUSD (ikke USDC.e). Hvis pUSD=0 men USDC.e>0 skal du
     wrappe: kald wrap() på CollateralOnramp 0x93070a847efEf7F70739046A929D47a521F5B8ee.
     """
-    clob = _get_clob_client()
-    wallet = clob.get_address()
+    wallet = os.environ["DEPOSIT_WALLET_ADDRESS"]
 
     # ERC-20 balanceOf(address): selector 0x70a08231 + 32-byte padded address
     padded = wallet[2:].lower().zfill(64)
