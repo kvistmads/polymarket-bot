@@ -49,33 +49,36 @@ _clob_client = None
 def _get_clob_client():
     """Returnér singleton ClobClient (V2). Initialiseret ved første kald (live mode).
 
-    Arkitektur (bekræftet via SDK-kildekode analyse):
+    Arkitektur (bekræftet via SDK-kildekode):
     - py-clob-client-v2 sætter ALTID order.signer = self.signer.address() = EOA
-    - API key er deterministisk bundet til deposit_wallet via EIP-1271 auth
-    - CLOB kræver order.signer == api_key.owner → EOA ≠ deposit_wallet → 400 fejl
-
-    Fix: monkey-patch builder.signer.address() til at returnere deposit_wallet.
-    - order.signer = deposit_wallet = api_key.owner ✓
-    - Signer.sign() bruger self.private_key direkte → upåvirket af patch ✓
+    - CLOB kræver order.signer == api_key.owner
+    - Løsning: deriv API key via L1-klient (EOA auth) → api_key.owner = EOA
+    - order.signer (EOA) == api_key.owner (EOA) ✓
+    - order.maker = deposit_wallet (via funder) + signature_type=POLY_1271 ✓
     - CLOB EIP-1271 verify: deposit_wallet.isValidSignature(hash, eoa_sig) ✓
-    - order.maker = deposit_wallet (via funder) ✓
+
+    Ingen browser-creds nødvendige — create_or_derive_api_key() er deterministisk
+    og selvfornyende. Ingen manuel .env-opdatering nogensinde.
     """
     global _clob_client
     if _clob_client is not None:
         return _clob_client
 
     from py_clob_client_v2 import ClobClient, SignatureTypeV2  # type: ignore[import]
-    from py_clob_client_v2.clob_types import ApiCreds  # type: ignore[import]
 
     key = os.environ["POLYMARKET_PRIVATE_KEY"]
     deposit_wallet = os.environ["DEPOSIT_WALLET_ADDRESS"]
 
-    creds = ApiCreds(
-        api_key=os.environ["CLOB_API_KEY"],
-        api_secret=os.environ["CLOB_SECRET"],
-        api_passphrase=os.environ["CLOB_PASSPHRASE"],
-    )
+    # Trin 1: Deriv/opret API key via L1-klient (EOA-signeret, ingen POLY_1271).
+    # create_or_derive_api_key() er deterministisk — returnerer eksisterende eller
+    # opretter ny. Altid bundet til EOA → matcher order.signer automatisk.
+    l1_client = ClobClient(host=CLOB_BASE, chain_id=_CHAIN_ID, key=key)
+    creds = l1_client.create_or_derive_api_key()
+    log.info("CLOB API key (re)deriveret: %s…", creds.api_key[:8])
 
+    # Trin 2: POLY_1271-klient med EOA-bundne creds + deposit_wallet som funder.
+    # order.signer = EOA = api_key.owner ✓
+    # order.maker  = deposit_wallet (fondene trækkes herfra via EIP-1271) ✓
     _clob_client = ClobClient(
         host=CLOB_BASE,
         chain_id=_CHAIN_ID,
@@ -84,15 +87,9 @@ def _get_clob_client():
         signature_type=SignatureTypeV2.POLY_1271,
         funder=deposit_wallet,
     )
-
-    # Monkey-patch: overskiv signer.address() så order.signer = deposit_wallet.
-    # Nødvendigt fordi SDK hardkoder self.signer.address() (= EOA) i order.signer,
-    # men CLOB kræver order.signer == api_key.owner == deposit_wallet.
-    # Signer.sign() bruger self.private_key direkte — upåvirket af denne patch.
-    _clob_client.builder.signer.address = lambda: deposit_wallet  # type: ignore[method-assign]
-
     log.info(
-        "CLOB V2 client initialiseret (key redacted, deposit_wallet=%s…, signer patched)",
+        "CLOB V2 client klar (key=%s…, deposit_wallet=%s…)",
+        creds.api_key[:8],
         deposit_wallet[:10],
     )
     return _clob_client
