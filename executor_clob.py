@@ -69,16 +69,20 @@ def _get_clob_client():
     key = os.environ["POLYMARKET_PRIVATE_KEY"]
     deposit_wallet = os.environ["DEPOSIT_WALLET_ADDRESS"]
 
-    # Trin 1: Deriv/opret API key via L1-klient (EOA-signeret, ingen POLY_1271).
-    # create_or_derive_api_key() er deterministisk — returnerer eksisterende eller
-    # opretter ny. Altid bundet til EOA → matcher order.signer automatisk.
-    l1_client = ClobClient(host=CLOB_BASE, chain_id=_CHAIN_ID, key=key)
-    creds = l1_client.create_or_derive_api_key()
-    log.info("CLOB API key (re)deriveret: %s…", creds.api_key[:8])
+    # Trin 1: Opret midlertidig POLY_1271-klient uden creds.
+    # create_or_derive_api_key() via POLY_1271 → key bundet til deposit_wallet.
+    # L1-auth virker IKKE for dette EOA (CLOB: "Could not create api key").
+    temp_client = ClobClient(
+        host=CLOB_BASE,
+        chain_id=_CHAIN_ID,
+        key=key,
+        signature_type=SignatureTypeV2.POLY_1271,
+        funder=deposit_wallet,
+    )
+    creds = temp_client.create_or_derive_api_key()
+    log.info("CLOB API key (re)deriveret via POLY_1271: %s…", creds.api_key[:8])
 
-    # Trin 2: POLY_1271-klient med EOA-bundne creds + deposit_wallet som funder.
-    # order.signer = EOA = api_key.owner ✓
-    # order.maker  = deposit_wallet (fondene trækkes herfra via EIP-1271) ✓
+    # Trin 2: Endelig POLY_1271-klient med gyldige creds.
     _clob_client = ClobClient(
         host=CLOB_BASE,
         chain_id=_CHAIN_ID,
@@ -87,8 +91,14 @@ def _get_clob_client():
         signature_type=SignatureTypeV2.POLY_1271,
         funder=deposit_wallet,
     )
+
+    # Monkey-patch: order.signer = deposit_wallet = api_key.owner ✓
+    # SDK hardkoder signer.address() = EOA, men api_key er bundet til deposit_wallet.
+    # Signer.sign() bruger private_key direkte — upåvirket.
+    _clob_client.builder.signer.address = lambda: deposit_wallet  # type: ignore[method-assign]
+
     log.info(
-        "CLOB V2 client klar (key=%s…, deposit_wallet=%s…)",
+        "CLOB V2 client klar (key=%s…, deposit_wallet=%s…, signer patched)",
         creds.api_key[:8],
         deposit_wallet[:10],
     )
