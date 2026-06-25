@@ -84,16 +84,18 @@ def _get_clob_client():
         signature_type=SignatureTypeV2.POLY_1271,
         funder=deposit_wallet,
     )
-    # Ingen monkey-patch:
-    # - api_key.owner = EOA (baseAddress i localStorage er EOA-adressen)
-    # - order.signer = EOA (SDK default via signer.address()) → matcher api_key.owner ✓
-    # - order.maker = deposit_wallet (via funder) + signature_type=POLY_1271 ✓
+    # Monkey-patch PÅKRÆVET:
+    # - api_key.owner = deposit_wallet (key gemt under deposit_wallet i localStorage-map)
+    # - SDK sætter order.signer = signer.address() = EOA → mismatch med api_key.owner
+    # - Patch: order.signer = deposit_wallet = api_key.owner ✓
+    # - Signer.sign() bruger self.private_key direkte — upåvirket af patch ✓
     # - CLOB EIP-1271: deposit_wallet.isValidSignature(order_hash, eoa_sig) ✓
+    _clob_client.builder.signer.address = lambda: deposit_wallet  # type: ignore[method-assign]
 
     log.info(
-        "CLOB V2 client klar (key=%s…, eoa=%s…)",
+        "CLOB V2 client klar (key=%s…, deposit_wallet=%s…)",
         creds.api_key[:8],
-        _clob_client.get_address()[:10],
+        deposit_wallet[:10],
     )
     return _clob_client
 
