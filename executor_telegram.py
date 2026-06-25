@@ -133,7 +133,7 @@ async def send_daily_summary(
         f"📊 <b>Daglig opsummering</b> — {date_str}",
         "",
         f"🏆 <b>Win rate:</b> {win_rate:.1%}  ({won}W / {lost}L / {pending} afventer)",
-        f"{pnl_emoji} <b>Sim. P&amp;L:</b> ${total_pnl:+.2f} USDC  (ROI {roi:+.1f}%)",
+        f"{pnl_emoji} <b>P&amp;L:</b> ${total_pnl:+.2f} USDC  (ROI {roi:+.1f}%)",
         f"🔢 <b>Trades i dag:</b> {today_count}  |  Total: {total}",
     ]
 

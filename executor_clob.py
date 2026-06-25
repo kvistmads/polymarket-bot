@@ -421,7 +421,13 @@ def _parse_order_result(
     fallback_size: Decimal,
     fallback_price: Decimal,
 ) -> OrderResult:
-    """Oversæt CLOB V2 API-svar til OrderResult."""
+    """Oversæt CLOB V2 API-svar til OrderResult.
+
+    CLOB V2 returnerer IKKE altid et 'price'-felt i matched-svar.
+    Vi forsøger derfor multiple felt-navne og beregner evt. fra
+    makerAmount/takerAmount. Sidst fallback til den pris vi beregnede
+    inden POST via calculate_market_price (order_args.price).
+    """
     if not isinstance(resp, dict):
         return OrderResult(
             status="failed",
@@ -429,6 +435,9 @@ def _parse_order_result(
             price=None,
             error_msg=f"Uventet svar-type: {type(resp)}",
         )
+
+    # Log resp-keys ved DEBUG så vi kan se hvad CLOB faktisk returnerer
+    log.debug("CLOB resp keys=%s body=%s", list(resp.keys()), str(resp)[:300])
 
     if resp.get("error"):
         return OrderResult(
@@ -443,11 +452,47 @@ def _parse_order_result(
         size_matched = (
             resp.get("size_matched") or resp.get("sizeMatched") or str(fallback_size)
         )
-        price_val = resp.get("price") or str(fallback_price)
+
+        # Forsøg multiple felt-navne for fill-prisen
+        price_val: Decimal | None = None
+        for key in ("price", "avg_price", "avgPrice", "average_price", "fill_price", "filledPrice"):
+            raw = resp.get(key)
+            if raw is not None:
+                try:
+                    candidate = Decimal(str(raw))
+                    if candidate > 0:
+                        price_val = candidate
+                        log.debug("CLOB fill-price fra felt '%s': %s", key, price_val)
+                        break
+                except Exception:
+                    pass
+
+        # Beregn pris fra makerAmount / takerAmount hvis tilgængeligt
+        if price_val is None:
+            maker_raw = resp.get("makerAmount") or resp.get("maker_amount")
+            taker_raw = resp.get("takerAmount") or resp.get("taker_amount")
+            if maker_raw and taker_raw:
+                try:
+                    maker = Decimal(str(maker_raw))
+                    taker = Decimal(str(taker_raw))
+                    if taker > 0:
+                        price_val = maker / taker
+                        log.debug("CLOB fill-price beregnet (maker/taker): %s", price_val)
+                except Exception:
+                    pass
+
+        # Fallback: brug prisen calculate_market_price beregnede inden POST
+        if price_val is None:
+            price_val = fallback_price
+            if fallback_price > 0:
+                log.debug("CLOB fill-price: ingen pris i resp — bruger order_args.price fallback: %s", fallback_price)
+            else:
+                log.warning("CLOB fill-price: kunne ikke bestemme pris! resp=%s", str(resp)[:300])
+
         return OrderResult(
             status="filled",
             size_filled=Decimal(str(size_matched)),
-            price=Decimal(str(price_val)),
+            price=price_val,
             error_msg=None,
         )
 
@@ -476,6 +521,10 @@ async def _place_fok_order(token_id: str, size: Decimal) -> OrderResult:
     """Opret og send én FOK BUY market-ordre via CLOB V2.
 
     size = USDC-beløb at købe for (ikke shares).
+
+    Vi splitter create_market_order + post_order i to trin for at fange
+    den pris SDK'et beregner via calculate_market_price (order_args.price).
+    Denne bruges som fallback hvis CLOB's POST-svar ikke indeholder 'price'.
     """
     from py_clob_client_v2 import MarketOrderArgs, OrderType  # type: ignore[import]
     from py_clob_client_v2.order_utils.model.side import Side  # type: ignore[import]
@@ -491,14 +540,18 @@ async def _place_fok_order(token_id: str, size: Decimal) -> OrderResult:
         order_type=OrderType.FOK,
     )
 
-    def _post() -> dict:
-        return clob.create_and_post_market_order(
-            order_args=order_args,
-            order_type=OrderType.FOK,
-        )
+    def _post() -> tuple[dict, Decimal]:
+        # Trin 1: byg ordre — calculate_market_price populates order_args.price
+        order = clob.create_market_order(order_args)
+        # Fang beregnet fill-pris (best ask på tidspunkt for ordrebyggeri)
+        fill_price = Decimal(str(order_args.price)) if getattr(order_args, "price", None) else Decimal("0")
+        log.info("BUY order bygget: token=%s size=%.4f calc_price=%s", token_id[:20], float(size), fill_price)
+        # Trin 2: POST ordren til CLOB
+        resp = clob.post_order(order, OrderType.FOK)
+        return resp, fill_price
 
     try:
-        resp = await loop.run_in_executor(None, _post)
+        resp, fill_price = await loop.run_in_executor(None, _post)
     except PolyException as exc:
         msg = str(exc).lower()
         if "no match" in msg:
@@ -514,7 +567,7 @@ async def _place_fok_order(token_id: str, size: Decimal) -> OrderResult:
             error_msg=str(exc)[:200],
         )
 
-    return _parse_order_result(resp, fallback_size=size, fallback_price=Decimal("0"))
+    return _parse_order_result(resp, fallback_size=size, fallback_price=fill_price)
 
 
 # ---------------------------------------------------------------------------
@@ -525,6 +578,9 @@ async def _place_fok_sell_order(token_id: str, shares: Decimal) -> OrderResult:
     """Opret og send én FOK SELL market-ordre via CLOB V2.
 
     shares = antal CTF-tokens at sælge.
+
+    Vi splitter create_market_order + post_order i to trin for at fange
+    den pris SDK'et beregner via calculate_market_price (best bid).
     """
     from py_clob_client_v2 import MarketOrderArgs, OrderType  # type: ignore[import]
     from py_clob_client_v2.order_utils.model.side import Side  # type: ignore[import]
@@ -540,14 +596,17 @@ async def _place_fok_sell_order(token_id: str, shares: Decimal) -> OrderResult:
         order_type=OrderType.FOK,
     )
 
-    def _post() -> dict:
-        return clob.create_and_post_market_order(
-            order_args=order_args,
-            order_type=OrderType.FOK,
-        )
+    def _post() -> tuple[dict, Decimal]:
+        # Trin 1: byg ordre — calculate_market_price populates order_args.price (best bid)
+        order = clob.create_market_order(order_args)
+        fill_price = Decimal(str(order_args.price)) if getattr(order_args, "price", None) else Decimal("0")
+        log.info("SELL order bygget: token=%s shares=%.4f calc_price=%s", token_id[:20], float(shares), fill_price)
+        # Trin 2: POST ordren til CLOB
+        resp = clob.post_order(order, OrderType.FOK)
+        return resp, fill_price
 
     try:
-        resp = await loop.run_in_executor(None, _post)
+        resp, fill_price = await loop.run_in_executor(None, _post)
     except PolyException as exc:
         msg = str(exc).lower()
         if "no match" in msg:
@@ -564,7 +623,7 @@ async def _place_fok_sell_order(token_id: str, shares: Decimal) -> OrderResult:
         )
 
     return _parse_order_result(
-        resp, fallback_size=shares, fallback_price=Decimal("0")
+        resp, fallback_size=shares, fallback_price=fill_price
     )
 
 
