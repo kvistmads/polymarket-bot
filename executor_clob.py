@@ -50,9 +50,7 @@ import json
 import logging
 import os
 import struct
-from contextlib import contextmanager
 from decimal import Decimal
-from typing import Generator
 
 import httpx
 
@@ -85,13 +83,6 @@ _ORDER_TYPE_STR = (
     "uint256 makerAmount,uint256 takerAmount,uint8 side,uint8 signatureType,"
     "uint256 timestamp,bytes32 metadata,bytes32 builder)"
 )
-_CLOB_AUTH_TYPE_STR = (
-    "ClobAuth(string address,string timestamp,uint256 nonce,string message)"
-)
-_MSG_TO_SIGN = "This message attests that I control the given wallet"
-_CLOB_DOMAIN_NAME = "ClobAuthDomain"
-_CLOB_DOMAIN_VERSION = "1"
-
 # Lazy-init singleton — kun brugt i live mode
 _clob_client = None
 
@@ -126,9 +117,8 @@ def _compute_tds_type_hash(primary_type_name: str, content_type_str: str) -> byt
     return _kk((tds_primary + content_type_str).encode())
 
 
-# Precomputed TypedDataSign type hashes
+# Precomputed TypedDataSign type hash for Order
 _TDS_ORDER_TYPE_HASH: bytes = _compute_tds_type_hash("Order", _ORDER_TYPE_STR)
-_TDS_AUTH_TYPE_HASH: bytes = _compute_tds_type_hash("ClobAuth", _CLOB_AUTH_TYPE_STR)
 
 
 def _build_poly1271_sig(
@@ -175,22 +165,6 @@ def _build_poly1271_sig(
     type_bytes = type_str.encode()
     trailer = struct.pack(">H", len(type_bytes))  # uint16 big-endian
     return inner_sig + app_dom_sep + contents_hash + type_bytes + trailer
-
-
-def _compute_clob_domain_sep() -> bytes:
-    """EIP-712 domain separator for ClobAuthDomain v1 (ingen verifyingContract)."""
-    from eth_abi import encode
-    DOMAIN_TH = _kk(b"EIP712Domain(string name,string version,uint256 chainId)")
-    NAME_H = _kk(_CLOB_DOMAIN_NAME.encode())
-    VER_H = _kk(_CLOB_DOMAIN_VERSION.encode())
-    return _kk(encode(
-        ["bytes32", "bytes32", "bytes32", "uint256"],
-        [DOMAIN_TH, NAME_H, VER_H, _CHAIN_ID],
-    ))
-
-
-# ClobAuth domain separator — beregnet én gang
-_CLOB_DOMAIN_SEP: bytes = _compute_clob_domain_sep()
 
 
 # ---------------------------------------------------------------------------
@@ -246,121 +220,6 @@ def _install_order_sig_patch(deposit_wallet: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# L1 auth patch — API-nøgle bundet til deposit_wallet
-# ---------------------------------------------------------------------------
-
-@contextmanager
-def _poly1271_l1_auth_patch(
-    deposit_wallet: str,
-    eoa_priv_key: str,
-) -> Generator[None, None, None]:
-    """Patch SDK L1 auth til deposit-wallet-bound ERC-7739 headers.
-
-    Problemet (Polymarket/py-clob-client-v2 issue #70, #75):
-      SDK sætter POLY_ADDRESS = EOA → API-nøgle bundet til EOA.
-      Ordrer sendes med order.signer = deposit_wallet.
-      CLOB tjekker order.signer == api_key.address → MISMATCH → 400.
-
-    Løsningen (verificeret via Rust SDK der virker korrekt):
-      POLY_ADDRESS = deposit_wallet
-      POLY_SIGNATURE = 317-byte ERC-7739 ClobAuth-sig (signeret af EOA)
-      CLOB kalder deposit_wallet.isValidSignature(clobauth_hash, sig)
-      via eth_call på Polygon for at validere.
-
-    Patchen er aktiv kun under create_or_derive_api_key()-kaldet.
-    """
-    from eth_utils import to_checksum_address
-    import py_clob_client_v2.signing.eip712 as _eip_mod  # type: ignore[import]
-
-    _deposit_chk = to_checksum_address(deposit_wallet)
-
-    # Beregn ClobAuth signatur via SDK's poly_eip712_structs.
-    # Strategi: CLOB gør ecrecover(clobauth_hash, sig) → EOA, og verificerer
-    # dernæst at EOA er ejer af deposit_wallet (via deposit_wallet.owner() on-chain).
-    # Sig er derfor en NORMAL 65-byte EOA ECDSA signatur — IKKE ERC-7739 wrapped.
-    def _build_clobauth_sig(timestamp: int, nonce: int) -> str:
-        from py_clob_client_v2.signing.model import ClobAuth  # type: ignore[import]
-        from py_clob_client_v2.signing.eip712 import get_clob_auth_domain  # type: ignore[import]
-        from eth_account import Account
-        from eth_utils import keccak as keccak256
-
-        # ClobAuth med deposit_wallet som address-felt.
-        # CLOB bygger samme struct på sin side med POLY_ADDRESS som address.
-        auth_msg = ClobAuth(
-            address=_deposit_chk,
-            timestamp=str(timestamp),
-            nonce=nonce,
-            message=_MSG_TO_SIGN,
-        )
-        # signable = b'\x19\x01' + clob_domain_sep (32) + struct_hash (32)
-        signable = bytes(auth_msg.signable_bytes(get_clob_auth_domain(_CHAIN_ID)))
-        final_hash = keccak256(signable)
-
-        # Standard 65-byte ECDSA signatur med EOA's nøgle
-        signed = Account._sign_hash(final_hash, private_key=eoa_priv_key)
-        sig_hex = "0x" + signed.signature.hex()
-        log.debug(
-            "ClobAuth L1 sig: address=%s…, sig_len=%d bytes",
-            _deposit_chk[:10],
-            len(sig_hex) - 2,
-        )
-        return sig_hex
-
-    def _patched_sign_auth(signer: object, timestamp: int, nonce: int) -> str:  # type: ignore[no-untyped-def]
-        return _build_clobauth_sig(timestamp, nonce)
-
-    _orig_sign_auth = _eip_mod.sign_clob_auth_message
-
-    # Patch sign_clob_auth_message i SDK's signing modul (dækker direkte kald)
-    _eip_mod.sign_clob_auth_message = _patched_sign_auth  # type: ignore[assignment]
-
-    # Byg den komplette create_level_1_headers patch med korrekt POLY_ADDRESS.
-    # Dækker tilfælde hvor SDK'et importerer create_level_1_headers direkte
-    # i client.py's namespace (i stedet for at kalde self._l1_headers).
-    def _patched_create_l1(signer: object, nonce: int | None = None, timestamp: int | None = None) -> dict:  # type: ignore[no-untyped-def]
-        from datetime import datetime
-        from py_clob_client_v2.headers.headers import (  # type: ignore[import]
-            POLY_ADDRESS as _PA,
-            POLY_SIGNATURE as _PS,
-            POLY_TIMESTAMP as _PT,
-            POLY_NONCE as _PN,
-        )
-        ts = int(timestamp) if timestamp is not None else int(datetime.now().timestamp())
-        n = int(nonce) if nonce is not None else 0
-        sig = _build_clobauth_sig(ts, n)
-        return {_PA: _deposit_chk, _PS: sig, _PT: str(ts), _PN: str(n)}
-
-    # Belt-and-suspenders: patch alle kendte bindinger
-    try:
-        import py_clob_client_v2.headers.headers as _hdr_mod  # type: ignore[import]
-        _orig_hdr_fn = getattr(_hdr_mod, "create_level_1_headers", None)
-        _hdr_mod.create_level_1_headers = _patched_create_l1  # type: ignore[assignment]
-    except Exception:
-        _orig_hdr_fn = None
-        _hdr_mod = None  # type: ignore[assignment]
-
-    try:
-        import py_clob_client_v2.client as _client_mod  # type: ignore[import]
-        _orig_client_fn = getattr(_client_mod, "create_level_1_headers", None)
-        if _orig_client_fn is not None:
-            _client_mod.create_level_1_headers = _patched_create_l1  # type: ignore[assignment]
-    except Exception:
-        _orig_client_fn = None
-        _client_mod = None  # type: ignore[assignment]
-
-    # Patch client-instansens _l1_headers sættes NEDENFOR (context manager bruges
-    # på den specifikke client-instans, se _get_clob_client).
-    try:
-        yield _deposit_chk, _build_clobauth_sig
-    finally:
-        _eip_mod.sign_clob_auth_message = _orig_sign_auth  # type: ignore[assignment]
-        if _hdr_mod is not None and _orig_hdr_fn is not None:
-            _hdr_mod.create_level_1_headers = _orig_hdr_fn  # type: ignore[assignment]
-        if _client_mod is not None and _orig_client_fn is not None:  # type: ignore[possibly-undefined]
-            _client_mod.create_level_1_headers = _orig_client_fn  # type: ignore[assignment,possibly-undefined]
-
-
-# ---------------------------------------------------------------------------
 # CLOB klient-initialisering
 # ---------------------------------------------------------------------------
 
@@ -368,65 +227,37 @@ def _get_clob_client():  # type: ignore[no-untyped-def]
     """Returnér singleton ClobClient (V2). Initialiseret ved første kald (live mode).
 
     Arkitektur:
-    - API-nøgle deriveret via POLY_1271 L1 auth → bundet til deposit_wallet
+    - API-nøgle deriveret med EOA via standard L1 auth (ingen patches nødvendige)
     - order.maker  = deposit_wallet (funder param)
     - order.signer = deposit_wallet (_DepositWalletSigner proxy)
     - Signatur: ERC-7739 317-byte TypedDataSign (via _install_order_sig_patch)
+
+    CLOB verificerer POLY_1271 ordrer via deposit_wallet.isValidSignature() og
+    tjekker at EOA (api_key.address) er owner af deposit_wallet on-chain.
     """
     global _clob_client
     if _clob_client is not None:
         return _clob_client
 
     from py_clob_client_v2 import ClobClient, SignatureTypeV2  # type: ignore[import]
-    from py_clob_client_v2.headers.headers import (  # type: ignore[import]
-        POLY_ADDRESS,
-        POLY_SIGNATURE,
-        POLY_TIMESTAMP,
-        POLY_NONCE,
-    )
-    from datetime import datetime
+    from eth_utils import to_checksum_address
 
     key = os.environ["POLYMARKET_PRIVATE_KEY"]
     deposit_wallet = os.environ["DEPOSIT_WALLET_ADDRESS"]
-
-    from eth_utils import to_checksum_address
     deposit_chk = to_checksum_address(deposit_wallet)
 
-    # Trin 1: Deriv API-nøgle via POLY_1271 L1 auth.
-    # Patchen sikrer POLY_ADDRESS = deposit_wallet + ERC-7739-wrapped ClobAuth-sig.
-    # CLOB kalder deposit_wallet.isValidSignature() på Polygon for validering.
-    l1_client = ClobClient(
-        host=CLOB_BASE,
-        chain_id=_CHAIN_ID,
-        key=key,
-    )
-
-    with _poly1271_l1_auth_patch(deposit_chk, key) as (deposit_chk_inner, build_auth_sig):
-        # Patch _l1_headers på den specifikke client-instans.
-        # Instance-attribut skygger class-metoden — Python slår __dict__ op FØR klassen.
-
-        def _patched_l1_headers(nonce=None):  # type: ignore[no-untyped-def]
-            ts = int(datetime.now().timestamp())
-            n = nonce if nonce is not None else 0
-            sig_hex = build_auth_sig(ts, n)
-            return {
-                POLY_ADDRESS: deposit_chk_inner,
-                POLY_SIGNATURE: sig_hex,
-                POLY_TIMESTAMP: str(ts),
-                POLY_NONCE: str(n),
-            }
-
-        l1_client._l1_headers = _patched_l1_headers  # type: ignore[method-assign]
-
-        creds = l1_client.create_or_derive_api_key()
-
+    # Trin 1: Deriv API-nøgle med EOA — standard flow, ingen patches.
+    # CLOB binder nøglen til EOA. For POLY_1271 ordrer verificerer CLOB
+    # at EOA == deposit_wallet.owner() on-chain.
+    l1_client = ClobClient(host=CLOB_BASE, chain_id=_CHAIN_ID, key=key)
+    creds = l1_client.create_or_derive_api_key()
     log.info(
-        "CLOB API-nøgle (re)deriveret via POLY_1271 L1 auth (deposit=%s…): %s…",
-        deposit_chk[:10],
+        "CLOB API-nøgle deriveret (EOA=%s…): %s…",
+        l1_client.signer.address()[:10],
         creds.api_key[:8],
     )
 
-    # Trin 2: Endelig POLY_1271-klient med de deposit-wallet-bundne creds
+    # Trin 2: Endelig POLY_1271-klient med deposit_wallet som funder
     _clob_client = ClobClient(
         host=CLOB_BASE,
         chain_id=_CHAIN_ID,
@@ -436,14 +267,9 @@ def _get_clob_client():  # type: ignore[no-untyped-def]
         funder=deposit_chk,
     )
 
-    # Trin 3: Builder-signer proxy.
-    # PROBLEM: client.signer og builder.signer er SAMME Python-objekt.
-    #   Patch address() in-place → POLY-ADDRESS i L2 auth = deposit_wallet → 401
-    #   (CLOB verificerer POLY-ADDRESS == api_key.signing_address = deposit_wallet
-    #   for L2-kaldet, men L2 auth bruger api_key direkte — ikke adressen)
-    #
-    # FIX: Erstat builder.signer med proxy der returnerer deposit_wallet fra
-    # address() men beholder EOA's private_key til POLY_1271 signing.
+    # Trin 3: Builder-signer proxy — order.signer = deposit_wallet.
+    # Nødvendigt for POLY_1271: CTF Exchange bruger order.signer til
+    # at kalde isValidSignature(). EOA's private_key bruges til selve signeringen.
     _eoa_signer = _clob_client.signer
 
     class _DepositWalletSigner:
@@ -460,12 +286,13 @@ def _get_clob_client():  # type: ignore[no-untyped-def]
 
     _clob_client.builder.signer = _DepositWalletSigner()
 
-    # Trin 4: Installer ordre-signatur patch (permanent for processens levetid)
+    # Trin 4: Installer ERC-7739 ordre-signatur patch (permanent for processens levetid)
     _install_order_sig_patch(deposit_chk)
 
     log.info(
-        "CLOB V2 client klar — key=%s…, deposit=%s…, sig=ERC-7739-317-byte",
+        "CLOB V2 client klar — key=%s…, EOA=%s…, deposit=%s…, sig=ERC-7739-317b",
         creds.api_key[:8],
+        _eoa_signer.address()[:10],
         deposit_chk[:10],
     )
     return _clob_client
