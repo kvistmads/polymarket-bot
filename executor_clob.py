@@ -49,47 +49,33 @@ _clob_client = None
 def _get_clob_client():
     """Returnér singleton ClobClient (V2). Initialiseret ved første kald (live mode).
 
-    Arkitektur (bekræftet via SDK-kildekode):
-    - py-clob-client-v2 sætter ALTID order.signer = self.signer.address() = EOA
-    - CLOB kræver order.signer == api_key.owner
-    - Løsning: deriv API key via L1-klient (EOA auth) → api_key.owner = EOA
-    - order.signer (EOA) == api_key.owner (EOA) ✓
-    - order.maker = deposit_wallet (via funder) + signature_type=POLY_1271 ✓
-    - CLOB EIP-1271 verify: deposit_wallet.isValidSignature(hash, eoa_sig) ✓
+    POLY_1271 arkitektur (bekræftet via localStorage + SDK-kildekode):
+    - api_key.owner = EOA (baseAddress i poly_clob_api_key_map)
+    - order.signer = EOA (SDK default) = api_key.owner ✓
+    - order.maker = deposit_wallet (via funder param)
+    - signature_type = POLY_1271 → CLOB kalder deposit_wallet.isValidSignature() ✓
 
-    Ingen browser-creds nødvendige — create_or_derive_api_key() er deterministisk
-    og selvfornyende. Ingen manuel .env-opdatering nogensinde.
+    Credentials udløber/invalideres når polymarket.com regenererer nøglen.
+    Hent nye via Console på polymarket.com:
+      JSON.parse(localStorage.getItem('poly_clob_api_key_map'))['<deposit_wallet>']
+    Opdater CLOB_API_KEY/SECRET/PASSPHRASE i .env på serveren.
     """
     global _clob_client
     if _clob_client is not None:
         return _clob_client
 
     from py_clob_client_v2 import ClobClient, SignatureTypeV2  # type: ignore[import]
+    from py_clob_client_v2.clob_types import ApiCreds  # type: ignore[import]
 
     key = os.environ["POLYMARKET_PRIVATE_KEY"]
     deposit_wallet = os.environ["DEPOSIT_WALLET_ADDRESS"]
 
-    # Trin 1: Opret POLY_1271-klient uden creds, og patch signer FØR key-oprettelse.
-    #
-    # client.signer og client.builder.signer er samme objekt (Signer).
-    # Ved at patche address() FØR create_or_derive_api_key() vil _l1_headers()
-    # sende address=deposit_wallet i auth-headeren. CLOB verificerer via EIP-1271:
-    #   deposit_wallet.isValidSignature(msg, eoa_sig) → ✓
-    # Derved oprettes/deriveres key med owner=deposit_wallet automatisk —
-    # ingen browser-creds, ingen manuel .env-opdatering nogensinde.
-    temp_client = ClobClient(
-        host=CLOB_BASE,
-        chain_id=_CHAIN_ID,
-        key=key,
-        signature_type=SignatureTypeV2.POLY_1271,
-        funder=deposit_wallet,
+    creds = ApiCreds(
+        api_key=os.environ["CLOB_API_KEY"],
+        api_secret=os.environ["CLOB_SECRET"],
+        api_passphrase=os.environ["CLOB_PASSPHRASE"],
     )
-    # Patch FØR key-oprettelse — påvirker _l1_headers() via self.signer
-    temp_client.signer.address = lambda: deposit_wallet  # type: ignore[method-assign]
-    creds = temp_client.create_or_derive_api_key()
-    log.info("CLOB API key (re)deriveret: %s…", creds.api_key[:8])
 
-    # Trin 2: Endelig klient med gyldige creds + patch til order-signering.
     _clob_client = ClobClient(
         host=CLOB_BASE,
         chain_id=_CHAIN_ID,
@@ -98,13 +84,16 @@ def _get_clob_client():
         signature_type=SignatureTypeV2.POLY_1271,
         funder=deposit_wallet,
     )
-    # Patch til ordrer: order.signer = deposit_wallet = api_key.owner ✓
-    _clob_client.builder.signer.address = lambda: deposit_wallet  # type: ignore[method-assign]
+    # Ingen monkey-patch:
+    # - api_key.owner = EOA (baseAddress i localStorage er EOA-adressen)
+    # - order.signer = EOA (SDK default via signer.address()) → matcher api_key.owner ✓
+    # - order.maker = deposit_wallet (via funder) + signature_type=POLY_1271 ✓
+    # - CLOB EIP-1271: deposit_wallet.isValidSignature(order_hash, eoa_sig) ✓
 
     log.info(
-        "CLOB V2 client klar (key=%s…, deposit_wallet=%s…)",
+        "CLOB V2 client klar (key=%s…, eoa=%s…)",
         creds.api_key[:8],
-        deposit_wallet[:10],
+        _clob_client.get_address()[:10],
     )
     return _clob_client
 
