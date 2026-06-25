@@ -274,38 +274,37 @@ def _poly1271_l1_auth_patch(
 
     _deposit_chk = to_checksum_address(deposit_wallet)
 
-    # Beregn ClobAuth struct hash via SDK's poly_eip712_structs.
-    # Bruger SDK's egne modeller for korrekt EIP-712 kodning af string-felter.
+    # Beregn ClobAuth signatur via SDK's poly_eip712_structs.
+    # Strategi: CLOB gør ecrecover(clobauth_hash, sig) → EOA, og verificerer
+    # dernæst at EOA er ejer af deposit_wallet (via deposit_wallet.owner() on-chain).
+    # Sig er derfor en NORMAL 65-byte EOA ECDSA signatur — IKKE ERC-7739 wrapped.
     def _build_clobauth_sig(timestamp: int, nonce: int) -> str:
         from py_clob_client_v2.signing.model import ClobAuth  # type: ignore[import]
         from py_clob_client_v2.signing.eip712 import get_clob_auth_domain  # type: ignore[import]
-        from eth_utils import keccak
+        from eth_account import Account
+        from eth_utils import keccak as keccak256
 
-        # ClobAuth med deposit_wallet som address-felt
+        # ClobAuth med deposit_wallet som address-felt.
+        # CLOB bygger samme struct på sin side med POLY_ADDRESS som address.
         auth_msg = ClobAuth(
             address=_deposit_chk,
             timestamp=str(timestamp),
             nonce=nonce,
             message=_MSG_TO_SIGN,
         )
-        # signable_bytes = b'\x19\x01' + clob_domain_sep (32) + struct_hash (32)
-        signable = auth_msg.signable_bytes(get_clob_auth_domain(_CHAIN_ID))
-        # Udled kontents-hash (struct hash) fra den allerede kodede signable
-        contents_hash: bytes = bytes(signable[34:66])  # struct_hash = bytes[34:66]
+        # signable = b'\x19\x01' + clob_domain_sep (32) + struct_hash (32)
+        signable = bytes(auth_msg.signable_bytes(get_clob_auth_domain(_CHAIN_ID)))
+        final_hash = keccak256(signable)
 
-        sig = _build_poly1271_sig(
-            app_dom_sep=_CLOB_DOMAIN_SEP,
-            contents_hash=contents_hash,
-            type_str=_CLOB_AUTH_TYPE_STR,
-            tds_type_hash=_TDS_AUTH_TYPE_HASH,
-            deposit_wallet=_deposit_chk,
-            priv_key=eoa_priv_key,
-        )
+        # Standard 65-byte ECDSA signatur med EOA's nøgle
+        signed = Account._sign_hash(final_hash, private_key=eoa_priv_key)
+        sig_hex = "0x" + signed.signature.hex()
         log.debug(
-            "POLY_1271 ClobAuth sig bygget: %d bytes (forventet 317)",
-            len(sig),
+            "ClobAuth L1 sig: address=%s…, sig_len=%d bytes",
+            _deposit_chk[:10],
+            len(sig_hex) - 2,
         )
-        return "0x" + sig.hex()
+        return sig_hex
 
     def _patched_sign_auth(signer: object, timestamp: int, nonce: int) -> str:  # type: ignore[no-untyped-def]
         return _build_clobauth_sig(timestamp, nonce)
