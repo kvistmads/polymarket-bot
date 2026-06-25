@@ -69,9 +69,14 @@ def _get_clob_client():
     key = os.environ["POLYMARKET_PRIVATE_KEY"]
     deposit_wallet = os.environ["DEPOSIT_WALLET_ADDRESS"]
 
-    # Trin 1: Opret midlertidig POLY_1271-klient uden creds.
-    # create_or_derive_api_key() via POLY_1271 → key bundet til deposit_wallet.
-    # L1-auth virker IKKE for dette EOA (CLOB: "Could not create api key").
+    # Trin 1: Opret POLY_1271-klient uden creds, og patch signer FØR key-oprettelse.
+    #
+    # client.signer og client.builder.signer er samme objekt (Signer).
+    # Ved at patche address() FØR create_or_derive_api_key() vil _l1_headers()
+    # sende address=deposit_wallet i auth-headeren. CLOB verificerer via EIP-1271:
+    #   deposit_wallet.isValidSignature(msg, eoa_sig) → ✓
+    # Derved oprettes/deriveres key med owner=deposit_wallet automatisk —
+    # ingen browser-creds, ingen manuel .env-opdatering nogensinde.
     temp_client = ClobClient(
         host=CLOB_BASE,
         chain_id=_CHAIN_ID,
@@ -79,10 +84,12 @@ def _get_clob_client():
         signature_type=SignatureTypeV2.POLY_1271,
         funder=deposit_wallet,
     )
+    # Patch FØR key-oprettelse — påvirker _l1_headers() via self.signer
+    temp_client.signer.address = lambda: deposit_wallet  # type: ignore[method-assign]
     creds = temp_client.create_or_derive_api_key()
-    log.info("CLOB API key (re)deriveret via POLY_1271: %s…", creds.api_key[:8])
+    log.info("CLOB API key (re)deriveret: %s…", creds.api_key[:8])
 
-    # Trin 2: Endelig POLY_1271-klient med gyldige creds.
+    # Trin 2: Endelig klient med gyldige creds + patch til order-signering.
     _clob_client = ClobClient(
         host=CLOB_BASE,
         chain_id=_CHAIN_ID,
@@ -91,14 +98,11 @@ def _get_clob_client():
         signature_type=SignatureTypeV2.POLY_1271,
         funder=deposit_wallet,
     )
-
-    # Monkey-patch: order.signer = deposit_wallet = api_key.owner ✓
-    # SDK hardkoder signer.address() = EOA, men api_key er bundet til deposit_wallet.
-    # Signer.sign() bruger private_key direkte — upåvirket.
+    # Patch til ordrer: order.signer = deposit_wallet = api_key.owner ✓
     _clob_client.builder.signer.address = lambda: deposit_wallet  # type: ignore[method-assign]
 
     log.info(
-        "CLOB V2 client klar (key=%s…, deposit_wallet=%s…, signer patched)",
+        "CLOB V2 client klar (key=%s…, deposit_wallet=%s…)",
         creds.api_key[:8],
         deposit_wallet[:10],
     )
