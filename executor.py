@@ -682,10 +682,12 @@ async def _update_resolved_orders() -> None:
                     total_pnl,
                     notify_mode,
                 )
+                # Live-ordrer: "P&L", paper-ordrer: "Sim. P&L"
+                pnl_label = "P&amp;L" if notify_mode == "live" else "Sim. P&amp;L"
                 await send_telegram(
                     f"{emoji} <b>{result} · {wallet_tags}:</b> {title}\n"
                     f"Udfald: {winning_outcome.upper()}\n"
-                    f"Sim. P&amp;L: ${total_pnl:+.2f} USDC  (ROI {roi:+.1f}%)",
+                    f"{pnl_label}: ${total_pnl:+.2f} USDC  (ROI {roi:+.1f}%)",
                     mode=notify_mode,
                 )
         except asyncio.CancelledError:
