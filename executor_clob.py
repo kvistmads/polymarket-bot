@@ -76,9 +76,7 @@ def _get_clob_client():
     creds = l1_client.create_or_derive_api_key()
     log.info("CLOB API key (re)deriveret via L1: %s…", creds.api_key[:8])
 
-    # Trin 2: Endelig POLY_1271-klient. Ingen monkey-patch:
-    # order.signer = EOA = api_key.owner ✓
-    # order.maker = deposit_wallet → EIP-1271 verify ✓
+    # Trin 2: Endelig POLY_1271-klient
     _clob_client = ClobClient(
         host=CLOB_BASE,
         chain_id=_CHAIN_ID,
@@ -87,6 +85,32 @@ def _get_clob_client():
         signature_type=SignatureTypeV2.POLY_1271,
         funder=deposit_wallet,
     )
+
+    # Trin 3: Separat signer-proxy til builder.
+    #
+    # PROBLEM: client.signer og builder.signer er SAMME Python-objekt.
+    #   Patch address() in-place → POLY-ADDRESS i L2 auth = deposit_wallet → 401
+    #   (CLOB verificerer POLY-ADDRESS == api_key.signing_address = EOA)
+    #
+    # FIX: Erstat builder.signer med en ny proxy-instans der:
+    #   - address() → deposit_wallet  (sætter order.signer = api_key.owner ✓)
+    #   - sign(msg) → EOA's private key  (EIP-1271 verify ✓)
+    # client.signer forbliver urørt → POLY-ADDRESS = EOA → L2 auth ✓
+    _eoa_signer = _clob_client.signer  # gemmer original EOA signer
+
+    class _DepositWalletSigner:
+        """Builder-signer: deposit_wallet som adresse, EOA's nøgle til signing."""
+
+        def address(self) -> str:  # noqa: N805
+            return deposit_wallet
+
+        def sign(self, msg: str) -> str:  # noqa: N805
+            return _eoa_signer.sign(msg)
+
+        def __getattr__(self, name: str):  # noqa: N805
+            return getattr(_eoa_signer, name)
+
+    _clob_client.builder.signer = _DepositWalletSigner()
 
     log.info(
         "CLOB V2 client klar (key=%s…, deposit_wallet=%s…)",
